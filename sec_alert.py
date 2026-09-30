@@ -7,7 +7,9 @@ Telegram commands:
   /list             show the watchlist
   /recent NCT [N]   latest N filings with what each one is about (default 5)
 
-Run periodically by GitHub Actions: handle commands -> check new filings -> save state.json.
+Alerts: new SEC filings and trading halts (Nasdaq halt feed, all US exchanges) for your watchlist.
+
+Run periodically by GitHub Actions: handle commands -> check filings -> check halts -> save state.json.
 No external packages (Python standard library only).
 """
 import html
@@ -25,6 +27,21 @@ UA = (os.environ.get("SEC_UA") or "").strip() or "sec-alert bot contact@example.
 STATE = Path("state.json")
 SKIP_FORMS = set()  # filing types you don't want alerts for. e.g. {"4", "144"}
 MENU_VERSION = 2  # bump when COMMANDS change so Telegram's menu gets refreshed
+HALTS_URL = "https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts"
+# Halt types you don't want alerts for. Default: skip the short automatic volatility pauses (usually 5 minutes).
+# Remove codes from this set to get those too.
+SKIP_HALT_CODES = {"M", "LUDP", "LUDS"}
+HALT_REASONS = {
+    "T1": "News pending", "T2": "News released", "T3": "News and resumption times",
+    "T5": "Single stock trading pause", "T6": "Extraordinary market activity",
+    "T7": "Quotation-only period", "T8": "ETF halt", "T12": "Additional information requested",
+    "H4": "Non-compliance", "H9": "Not current in required filings", "H10": "SEC trading suspension",
+    "H11": "Regulatory concern", "O1": "Operations halt", "IPO1": "IPO not yet trading",
+    "M1": "Corporate action", "M2": "Quotation not available",
+    "M": "Volatility pause (LULD)", "LUDP": "Volatility pause (LULD)", "LUDS": "Volatility pause (LULD)",
+    "MWC1": "Market-wide circuit breaker (level 1)", "MWC2": "Market-wide circuit breaker (level 2)",
+    "MWC3": "Market-wide circuit breaker (level 3)", "D": "Security deletion",
+}
 
 HELP = (
     "Commands:\n"
@@ -32,7 +49,8 @@ HELP = (
     "/remove TICKER [TICKER...] — remove from watchlist\n"
     "/removeall — clear the watchlist\n"
     "/list — show watchlist\n"
-    "/recent TICKER [N] — latest N filings (default 5, max 20)"
+    "/recent TICKER [N] — latest N filings (default 5, max 20)\n\n"
+    "You get alerts for new SEC filings and trading halts on your watchlist."
 )
 COMMANDS = [
     {"command": "add", "description": "Add tickers: /add NCT AAPL"},
@@ -337,10 +355,71 @@ def check_filings(state):
         w["seen"] = [f["acc"] for f in filings]
 
 
+# ---------- Check trading halts ----------
+def fetch_halts():
+    """Current Nasdaq halt feed (covers NYSE, Arca, AMEX too) as a list of dicts."""
+    req = urllib.request.Request(HALTS_URL, headers={"User-Agent": "Mozilla/5.0 (sec-alert bot)"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        xml = r.read().decode("utf-8", "replace")
+    halts = []
+    for item in re.findall(r"(?s)<item>(.*?)</item>", xml):
+        def tag(name):
+            m = re.search(rf"(?s)<ndaq:{name}>(.*?)</ndaq:{name}>", item)
+            return html.unescape(m.group(1)).strip() if m else ""
+        halts.append({
+            "symbol": tag("IssueSymbol").upper(), "name": tag("IssueName"), "market": tag("Market"),
+            "code": tag("ReasonCode"), "date": tag("HaltDate"), "time": tag("HaltTime").split(".")[0],
+            "resume_date": tag("ResumptionDate"), "resume_time": tag("ResumptionTradeTime").split(".")[0],
+        })
+    return halts
+
+
+def halt_reason(code):
+    return f"{HALT_REASONS.get(code, 'Other')} ({code})" if code else "Not given"
+
+
+def check_halts(state):
+    watch = state["watch"]
+    if not watch:
+        return
+    try:
+        halts = fetch_halts()
+    except Exception as e:  # halt feed down -> just try again next run
+        print(f"halt feed failed: {e}")
+        return
+    known = state.setdefault("halts", {})  # key -> True once "resumed" has been reported
+    recent = {time.strftime("%m/%d/%Y", time.gmtime(time.time() - d * 86400)) for d in range(3)}
+    current = set()
+    for h in halts:
+        if h["symbol"] not in watch or h["code"] in SKIP_HALT_CODES:
+            continue
+        key = f"{h['symbol']}|{h['date']}|{h['time']}|{h['code']}"
+        current.add(key)
+        resumed = bool(h["resume_time"])
+        where = f" · {h['market']}" if h["market"] else ""
+        if key not in known:
+            # new halt: alert if it's still ongoing, or it happened in the last few days
+            if not resumed or h["date"] in recent:
+                status = (f"Resumed: {h['resume_date']} {h['resume_time']} ET" if resumed
+                          else "Still halted — you'll get a message when trading resumes.")
+                send(f"⛔ Trading halt — {h['symbol']}{where}\n{watch[h['symbol']]['name']}\n\n"
+                     f"Reason: {halt_reason(h['code'])}\nHalted: {h['date']} {h['time']} ET\n{status}")
+            known[key] = resumed
+        elif resumed and not known[key]:
+            send(f"✅ Trading resumed — {h['symbol']}{where}\n{watch[h['symbol']]['name']}\n\n"
+                 f"Halted {h['date']} {h['time']} → resumed {h['resume_date']} {h['resume_time']} ET\n"
+                 f"Reason was: {halt_reason(h['code'])}")
+            known[key] = True
+    for key in list(known):  # forget halts that dropped off the feed or tickers you removed
+        if key not in current:
+            del known[key]
+
+
 def main():
     state = json.loads(STATE.read_text()) if STATE.exists() else {"offset": 0, "watch": {}}
     handle_commands(state)
     check_filings(state)
+    check_halts(state)
     # guarantees a commit at least monthly, so GitHub doesn't disable the schedule after 60 idle days
     state["heartbeat"] = time.strftime("%Y-%m")
     STATE.write_text(json.dumps(state, indent=1, ensure_ascii=False, sort_keys=True) + "\n")
