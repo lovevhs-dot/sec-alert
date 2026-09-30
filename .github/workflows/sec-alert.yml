@@ -1,0 +1,33 @@
+name: sec-alert
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # 15분마다 (실제로는 GitHub 사정에 따라 몇 분씩 밀림)
+  workflow_dispatch:          # Actions 탭에서 수동 실행 가능
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sec-alert
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check filings
+        run: python3 sec_alert.py
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          SEC_UA: ${{ secrets.SEC_UA }}
+
+      - name: Save state
+        run: |
+          git config user.name "sec-alert-bot"
+          git config user.email "sec-alert-bot@users.noreply.github.com"
+          git add state.json
+          git diff --cached --quiet || (git commit -m "update state" && git push)
