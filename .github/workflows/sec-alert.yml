@@ -2,8 +2,8 @@ name: sec-alert
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # 15분마다 (실제로는 GitHub 사정에 따라 몇 분씩 밀림)
-  workflow_dispatch:          # Actions 탭에서 수동 실행 가능
+    - cron: "*/15 * * * *"   # every 15 min (GitHub often runs a few minutes late)
+  workflow_dispatch:          # lets you run it manually from the Actions tab
 
 permissions:
   contents: write
