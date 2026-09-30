@@ -1,12 +1,13 @@
-"""SEC 공시 → 텔레그램 알림 봇.
+"""SEC filing -> Telegram alert bot.
 
-텔레그램 명령:
-  /add NCT AAPL   종목 추가 (여러 개 가능)
-  /remove NCT     종목 삭제
-  /list           현재 목록
+Telegram commands:
+  /add NCT AAPL   add tickers (one or more)
+  /remove NCT     remove tickers
+  /list           show the watchlist
+  /recent NCT     show the 5 latest filings (any ticker; /recent NCT 10 for more)
 
-GitHub Actions가 주기적으로 실행: 명령 처리 → 새 공시 확인 → state.json 저장.
-외부 패키지 없음 (파이썬 표준 라이브러리만 사용).
+Run periodically by GitHub Actions: handle commands -> check new filings -> save state.json.
+No external packages (Python standard library only).
 """
 import json
 import os
@@ -17,16 +18,16 @@ from pathlib import Path
 
 TOKEN = os.environ["TG_TOKEN"]
 CHAT_ID = str(os.environ["TG_CHAT_ID"])
-UA = os.environ.get("SEC_UA") or "sec-alert bot contact@example.com"  # SEC는 연락처가 담긴 User-Agent 요구
+UA = os.environ.get("SEC_UA") or "sec-alert bot contact@example.com"  # SEC requires a User-Agent with contact info
 STATE = Path("state.json")
-SKIP_FORMS = set()  # 받기 싫은 공시 유형. 예: {"4", "144", "SC 13G/A"}
+SKIP_FORMS = set()  # filing types you don't want. e.g. {"4", "144", "SC 13G/A"}
 
-HELP = "/add 티커 [티커...]  종목 추가\n/remove 티커  종목 삭제\n/list  목록 보기"
+HELP = "/add TICKER [TICKER...]  add to watchlist\n/remove TICKER  remove from watchlist\n/list  show watchlist\n/recent TICKER [N]  latest N filings (default 5)"
 
 
 # ---------- HTTP ----------
 def sec_json(url):
-    time.sleep(0.2)  # SEC 제한: 초당 10회
+    time.sleep(0.2)  # SEC limit: 10 requests/second
     req = urllib.request.Request(url, headers={"User-Agent": UA})
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.load(r)
@@ -48,7 +49,7 @@ _tickers = None
 
 
 def lookup(ticker):
-    """티커 → {'cik_str', 'ticker', 'title'} (없으면 None)"""
+    """ticker -> {'cik_str', 'ticker', 'title'} (None if not found)"""
     global _tickers
     if _tickers is None:
         raw = sec_json("https://www.sec.gov/files/company_tickers.json")
@@ -57,7 +58,7 @@ def lookup(ticker):
 
 
 def recent_filings(cik):
-    """최근 공시 최대 100건, 최신순."""
+    """Up to 100 most recent filings, newest first."""
     r = sec_json(f"https://data.sec.gov/submissions/CIK{int(cik):010d}.json")["filings"]["recent"]
     return [
         {
@@ -75,14 +76,14 @@ def filing_url(cik, f):
     return f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{f['acc'].replace('-', '')}/{f['doc'] or ''}"
 
 
-# ---------- 텔레그램 명령 처리 ----------
+# ---------- Telegram commands ----------
 def handle_commands(state):
     watch = state["watch"]
     for u in tg("getUpdates", offset=state["offset"], timeout=0).get("result", []):
         state["offset"] = u["update_id"] + 1
         msg = u.get("message") or {}
         if str(msg.get("chat", {}).get("id")) != CHAT_ID:
-            continue  # 본인 채팅 외 무시
+            continue  # ignore anyone but you
         parts = (msg.get("text") or "").split()
         if not parts:
             continue
@@ -92,36 +93,49 @@ def handle_commands(state):
         if cmd == "/add" and args:
             for t in args:
                 if t in watch:
-                    send(f"{t}: 이미 목록에 있음")
+                    send(f"{t}: already on the watchlist")
                     continue
                 info = lookup(t)
                 if not info:
-                    send(f"{t}: SEC에서 티커를 못 찾음")
+                    send(f"{t}: ticker not found on SEC")
                     continue
                 filings = recent_filings(info["cik_str"])
-                # 기존 공시는 '본 것'으로 처리 → 추가 직후 알림 폭탄 방지
+                # mark existing filings as seen -> no flood of old alerts right after adding
                 watch[t] = {"cik": info["cik_str"], "name": info["title"], "seen": [f["acc"] for f in filings]}
-                last = f"\n최근 공시: {filings[0]['form']} ({filings[0]['date']})" if filings else ""
-                send(f"✅ {t} 추가 — {info['title']}{last}")
+                last = f"\nLatest filing: {filings[0]['form']} ({filings[0]['date']})" if filings else ""
+                send(f"✅ Added {t} — {info['title']}{last}")
         elif cmd == "/remove" and args:
             for t in args:
-                send(f"🗑 {t} 삭제" if watch.pop(t, None) else f"{t}: 목록에 없음")
+                send(f"🗑 Removed {t}" if watch.pop(t, None) else f"{t}: not on the watchlist")
+        elif cmd == "/recent" and args:
+            t = args[0]
+            n = min(int(args[1]), 20) if len(args) > 1 and args[1].isdigit() else 5
+            info = watch.get(t) or lookup(t)
+            if not info:
+                send(f"{t}: ticker not found on SEC")
+                continue
+            cik = info.get("cik") or info.get("cik_str")
+            name = info.get("name") or info.get("title")
+            lines = [f"📋 {t} — {name} (latest {n})"]
+            for f in recent_filings(cik)[:n]:
+                lines.append(f"\n{f['form']} · {f['date']}\n{filing_url(cik, f)}")
+            send("\n".join(lines))
         elif cmd == "/list":
-            send("\n".join(f"{t} — {w['name']}" for t, w in sorted(watch.items())) or "목록 비어 있음")
+            send("\n".join(f"{t} — {w['name']}" for t, w in sorted(watch.items())) or "Watchlist is empty")
         else:
             send(HELP)
 
 
-# ---------- 새 공시 확인 ----------
+# ---------- Check new filings ----------
 def check_filings(state):
     for t, w in state["watch"].items():
         try:
             filings = recent_filings(w["cik"])
-        except Exception as e:  # 한 종목 실패해도 나머지는 계속
+        except Exception as e:  # one ticker failing shouldn't stop the rest
             print(f"{t}: {e}")
             continue
         seen = set(w["seen"])
-        for f in reversed([f for f in filings if f["acc"] not in seen]):  # 오래된 것부터 전송
+        for f in reversed([f for f in filings if f["acc"] not in seen]):  # send oldest first
             if f["form"] in SKIP_FORMS:
                 continue
             desc = f"\n{f['desc']}" if f["desc"] else ""
@@ -133,7 +147,7 @@ def main():
     state = json.loads(STATE.read_text()) if STATE.exists() else {"offset": 0, "watch": {}}
     handle_commands(state)
     check_filings(state)
-    # 한 달에 한 번은 커밋이 생기게 해서 GitHub의 '60일 비활성 시 스케줄 중지' 방지
+    # guarantees a commit at least monthly, so GitHub doesn't disable the schedule after 60 idle days
     state["heartbeat"] = time.strftime("%Y-%m")
     STATE.write_text(json.dumps(state, indent=1, ensure_ascii=False, sort_keys=True) + "\n")
 
