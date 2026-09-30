@@ -17,6 +17,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: main   # always start from the newest saved state, not the one from when the run was queued
 
       - name: Check filings
         run: python3 sec_alert.py
