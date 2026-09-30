@@ -16,9 +16,9 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-TOKEN = os.environ["TG_TOKEN"]
-CHAT_ID = str(os.environ["TG_CHAT_ID"])
-UA = os.environ.get("SEC_UA") or "sec-alert bot contact@example.com"  # SEC requires a User-Agent with contact info
+TOKEN = os.environ["TG_TOKEN"].strip()
+CHAT_ID = os.environ["TG_CHAT_ID"].strip()
+UA = (os.environ.get("SEC_UA") or "").strip() or "sec-alert bot contact@example.com"  # SEC requires a User-Agent with contact info
 STATE = Path("state.json")
 SKIP_FORMS = set()  # filing types you don't want. e.g. {"4", "144", "SC 13G/A"}
 
@@ -77,12 +77,28 @@ def filing_url(cik, f):
 
 
 # ---------- Telegram commands ----------
+COMMANDS = [
+    {"command": "add", "description": "Add tickers: /add NCT AAPL"},
+    {"command": "remove", "description": "Remove tickers: /remove NCT"},
+    {"command": "list", "description": "Show watchlist"},
+    {"command": "recent", "description": "Latest filings: /recent NCT 5"},
+]
+
+
 def handle_commands(state):
     watch = state["watch"]
-    for u in tg("getUpdates", offset=state["offset"], timeout=0).get("result", []):
+    if not state.get("menu_set"):  # show the command menu in Telegram (once)
+        tg("setMyCommands", commands=json.dumps(COMMANDS))
+        state["menu_set"] = True
+    updates = tg("getUpdates", offset=state["offset"], timeout=0).get("result", [])
+    print(f"{len(updates)} new Telegram message(s)")
+    for u in updates:
         state["offset"] = u["update_id"] + 1
         msg = u.get("message") or {}
-        if str(msg.get("chat", {}).get("id")) != CHAT_ID:
+        chat = str(msg.get("chat", {}).get("id"))
+        print(f"  from chat {chat}: {msg.get('text')!r}")
+        if chat != CHAT_ID:
+            print(f"  ignored: chat {chat} does not match TG_CHAT_ID secret")
             continue  # ignore anyone but you
         parts = (msg.get("text") or "").split()
         if not parts:
