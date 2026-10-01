@@ -2,8 +2,8 @@
  "halts": {},
  "heartbeat": "2026-10",
  "menu_set": true,
- "menu_version": 2,
- "offset": 506744758,
+ "menu_version": 3,
+ "offset": 506744760,
  "watch": {
   "NCT": {
    "cik": 2018529,
