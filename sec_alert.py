@@ -27,7 +27,7 @@ CHAT_ID = os.environ["TG_CHAT_ID"].strip()
 UA = (os.environ.get("SEC_UA") or "").strip() or "sec-alert bot contact@example.com"  # SEC requires a User-Agent with contact info
 STATE = Path("state.json")
 SKIP_FORMS = set()  # filing types you don't want alerts for. e.g. {"4", "144"}
-MENU_VERSION = 3  # bump when COMMANDS change so Telegram's menu gets refreshed
+MENU_VERSION = 4  # bump when COMMANDS change so Telegram's menu gets refreshed
 HALTS_URL = "https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts"
 # Halt types you don't want alerts for. Default: skip the short automatic volatility pauses (usually 5 minutes).
 # Remove codes from this set to get those too.
@@ -50,8 +50,7 @@ HELP = (
     "/remove TICKER [TICKER...] — remove from watchlist\n"
     "/removeall — clear the watchlist\n"
     "/list — show watchlist\n"
-    "/recent TICKER [N] — latest N filings (default 5, max 20)\n"
-    "/shares TICKER — share count history reported to SEC\n\n"
+    "/recent TICKER [N] — latest N filings (default 5, max 20)\n\n"
     "You get alerts for new SEC filings and trading halts on your watchlist. "
     "Filings that can add new shares are marked ⚠️."
 )
@@ -61,7 +60,6 @@ COMMANDS = [
     {"command": "removeall", "description": "Clear the whole watchlist"},
     {"command": "list", "description": "Show watchlist"},
     {"command": "recent", "description": "Latest filings: /recent NCT 5"},
-    {"command": "shares", "description": "Share count history: /shares NCT"},
 ]
 
 # ---------- Dilution / share-count warning ----------
@@ -281,20 +279,6 @@ def filing_block(cik, f, number=None):
     return "\n".join([head] + lines)
 
 
-def share_history(cik):
-    """Shares outstanding as reported on SEC cover pages, oldest first: [(date, shares, form)]."""
-    try:
-        data = sec_json(f"https://data.sec.gov/api/xbrl/companyconcept/CIK{int(cik):010d}/dei/EntityCommonStockSharesOutstanding.json")
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            return []
-        raise
-    by_date = {}
-    for unit in data.get("units", {}).values():
-        for r in unit:
-            by_date[r["end"]] = (r["end"], int(r["val"]), r.get("form", ""))  # one value per date
-    return [by_date[d] for d in sorted(by_date)]
-
 
 # ---------- Telegram commands ----------
 def handle_commands(state):
@@ -369,25 +353,6 @@ def run_command(watch, cmd, args):
             return
         blocks = [filing_block(info["cik"], f, i + 1) for i, f in enumerate(recent_filings(info["cik"], n))]
         send(f"🗂 Latest {n} filings — {t} ({info['name']})\n\n" + "\n\n".join(blocks))
-
-    elif cmd == "/shares" and args:
-        t = args[0]
-        info = watch.get(t) or lookup(t)
-        if not info:
-            send(f"{t}: not found on SEC — check the ticker")
-            return
-        hist = share_history(info["cik"])[-8:]
-        if not hist:
-            send(f"📊 {t} — {info['name']}\n\nSEC has no reported share count for this company.")
-            return
-        rows, prev = [], None
-        for date, val, form in hist:
-            change = f" ({(val - prev) / prev * 100:+.1f}%)" if prev else ""
-            rows.append(f"{date} · {val:,}{change} · {form}")
-            prev = val
-        send(f"📊 Shares outstanding — {t} ({info['name']})\n\n" + "\n".join(rows) +
-             "\n\nAs reported on SEC cover pages: quarterly for US companies, yearly for foreign issuers. "
-             "Recent offerings or splits may not be included yet.")
 
     else:
         send(HELP)
