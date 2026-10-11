@@ -6,8 +6,10 @@ Telegram commands:
   /removeall        clear the whole watchlist
   /list             show the watchlist
   /recent NCT [N]   latest N filings with what each one is about (default 5)
+  /dividends NCT    dividend history from SEC financial data (per share + total paid)
 
 Alerts: new SEC filings and trading halts (Nasdaq halt feed, all US exchanges) for your watchlist.
+Filings that mention a dividend are marked 💰.
 
 Run periodically by GitHub Actions: handle commands -> check filings -> check halts -> save state.json.
 No external packages (Python standard library only).
@@ -20,6 +22,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import date
 from pathlib import Path
 
 TOKEN = os.environ["TG_TOKEN"].strip()
@@ -27,7 +30,7 @@ CHAT_ID = os.environ["TG_CHAT_ID"].strip()
 UA = (os.environ.get("SEC_UA") or "").strip() or "sec-alert bot contact@example.com"  # SEC requires a User-Agent with contact info
 STATE = Path("state.json")
 SKIP_FORMS = set()  # filing types you don't want alerts for. e.g. {"4", "144"}
-MENU_VERSION = 4  # bump when COMMANDS change so Telegram's menu gets refreshed
+MENU_VERSION = 5  # bump when COMMANDS change so Telegram's menu gets refreshed
 HALTS_URL = "https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts"
 # Halt types you don't want alerts for. Default: skip the short automatic volatility pauses (usually 5 minutes).
 # Remove codes from this set to get those too.
@@ -50,9 +53,10 @@ HELP = (
     "/remove TICKER [TICKER...] — remove from watchlist\n"
     "/removeall — clear the watchlist\n"
     "/list — show watchlist\n"
-    "/recent TICKER [N] — latest N filings (default 5, max 20)\n\n"
+    "/recent TICKER [N] — latest N filings (default 5, max 20)\n"
+    "/dividends TICKER — dividend history (per share + total paid)\n\n"
     "You get alerts for new SEC filings and trading halts on your watchlist. "
-    "Filings that can add new shares are marked ⚠️."
+    "Filings that can add new shares are marked ⚠️, filings that mention a dividend 💰."
 )
 COMMANDS = [
     {"command": "add", "description": "Add tickers: /add NCT AAPL"},
@@ -60,6 +64,7 @@ COMMANDS = [
     {"command": "removeall", "description": "Clear the whole watchlist"},
     {"command": "list", "description": "Show watchlist"},
     {"command": "recent", "description": "Latest filings: /recent NCT 5"},
+    {"command": "dividends", "description": "Dividend history: /dividends AAPL"},
 ]
 
 # ---------- Dilution / share-count warning ----------
@@ -70,6 +75,26 @@ DILUTION_WORDS = re.compile(
     r"convertible|PIPE|underwrit\w*|prospectus supplement|issuance of (ordinary|common) shares)\b"
 )
 SPLIT_WORDS = re.compile(r"(?i)\b(reverse (stock |share )?split|share consolidation)\b")
+DIVIDEND_WORDS = re.compile(
+    r"(?i)\b(dividends?|cash distributions?|special distributions?|distributions? (to|per) (share|unit)holders?)\b"
+)
+
+# ---------- Dividend history (SEC XBRL financial data) ----------
+# (taxonomy, concept). First ones are preferred; the bot uses whichever has the newest data.
+DIV_PER_SHARE = [
+    ("us-gaap", "CommonStockDividendsPerShareDeclared"),
+    ("us-gaap", "CommonStockDividendsPerShareCashPaid"),
+    ("ifrs-full", "DividendsRecognisedAsDistributionsToOwnersPerShare"),
+]
+DIV_TOTAL = [
+    ("us-gaap", "PaymentsOfDividendsCommonStock"),
+    ("us-gaap", "PaymentsOfDividends"),
+    ("us-gaap", "DividendsCommonStockCash"),
+    ("us-gaap", "DividendsCommonStock"),
+    ("ifrs-full", "DividendsPaidClassifiedAsFinancingActivities"),
+    ("ifrs-full", "DividendsPaidToEquityHoldersOfParentClassifiedAsFinancingActivities"),
+    ("ifrs-full", "DividendsPaid"),
+]
 
 FORM_NAMES = {
     "10-K": "Annual report", "10-Q": "Quarterly report", "8-K": "Current report",
@@ -276,8 +301,79 @@ def filing_block(cik, f, number=None):
         lines.append("⚠️ Possible dilution: may add new shares (check the filing)")
     if SPLIT_WORDS.search(text):
         lines.append("⚠️ Reverse split / share consolidation mentioned")
+    if DIVIDEND_WORDS.search(text):
+        lines.append("💰 Dividend / distribution mentioned")
     return "\n".join([head] + lines)
 
+
+
+def annual_series(facts, concepts):
+    """Best concept -> (unit, {fiscal_year_end: value}) using full-year figures only."""
+    best = None
+    for tax, name in concepts:
+        node = facts.get(tax, {}).get(name)
+        if not node:
+            continue
+        for unit, rows in node.get("units", {}).items():
+            years = {}  # end -> (filed, val); a later filing (restatement) wins
+            for r in rows:
+                if "start" not in r or "end" not in r:
+                    continue
+                days = (date.fromisoformat(r["end"]) - date.fromisoformat(r["start"])).days
+                if not 330 <= days <= 380:  # skip quarters / partial periods
+                    continue
+                if r["end"] not in years or r.get("filed", "") > years[r["end"]][0]:
+                    years[r["end"]] = (r.get("filed", ""), r["val"])
+            if years and (best is None or max(years) > max(best[1])):
+                best = (unit, {e: v for e, (_, v) in years.items()})
+    return best
+
+
+def money(val, unit, per_share=False):
+    cur = unit.split("/")[0].upper()
+    sym = "$" if cur == "USD" else cur + " "
+    if per_share:
+        return f"{sym}{val:,.4f}".rstrip("0").rstrip(".") if val else f"{sym}0"
+    for div, suf in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if abs(val) >= div:
+            return f"{sym}{val / div:,.2f}{suf}"
+    return f"{sym}{val:,.0f}"
+
+
+def dividend_report(t, info, years=6):
+    try:
+        facts = sec_json(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{int(info['cik']):010d}.json").get("facts", {})
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return f"💰 Dividends — {t} ({info['name']})\n\nNo financial data on SEC for this company (common for funds/ETFs and some small or new issuers)."
+        raise
+    ps, tot = annual_series(facts, DIV_PER_SHARE), annual_series(facts, DIV_TOTAL)
+    ends = sorted(set((ps or (0, {}))[1]) | set((tot or (0, {}))[1]), reverse=True)[:years]
+    head = f"💰 Dividends — {t} ({info['name']})"
+    if not ends:
+        return (f"{head}\n\nNo dividends found in SEC financial data.\n"
+                "Most likely it doesn't pay one — but some foreign or small issuers don't tag this data, "
+                "so check /recent for announcements to be sure.")
+    rows = []
+    for e in ends:
+        parts = [f"FY ending {e}"]
+        if ps and e in ps[1]:
+            parts.append(f"{money(ps[1][e], ps[0], True)}/share")
+        if tot and e in tot[1]:
+            parts.append(f"{money(tot[1][e], tot[0])} paid")
+        rows.append(" · ".join(parts))
+    paid = any(v for s in (ps, tot) if s for e, v in s[1].items() if e in ends)
+    latest = ends[0]
+    latest_paid = any(s and s[1].get(latest) for s in (ps, tot))
+    if not paid:
+        verdict = "No dividends in the last few fiscal years (reported as 0)."
+    elif latest_paid:
+        verdict = "✅ Paid dividends in its latest reported fiscal year."
+    else:
+        verdict = "⚠️ Paid dividends before, but nothing in its latest reported fiscal year."
+    return (f"{head}\n{verdict}\n\n" + "\n".join(rows) +
+            "\n\nFull-year figures from annual reports (10-K / 20-F). The most recent quarter isn't included — "
+            "new dividend announcements show up as 💰 in filing alerts and /recent.")
 
 
 # ---------- Telegram commands ----------
@@ -353,6 +449,14 @@ def run_command(watch, cmd, args):
             return
         blocks = [filing_block(info["cik"], f, i + 1) for i, f in enumerate(recent_filings(info["cik"], n))]
         send(f"🗂 Latest {n} filings — {t} ({info['name']})\n\n" + "\n\n".join(blocks))
+
+    elif cmd in ("/dividends", "/dividend") and args:
+        t = args[0]
+        info = watch.get(t) or lookup(t)
+        if not info:
+            send(f"{t}: not found on SEC — check the ticker")
+            return
+        send(dividend_report(t, info))
 
     else:
         send(HELP)
