@@ -36,15 +36,18 @@ HALTS_URL = "https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts"
 # Remove codes from this set to get those too.
 SKIP_HALT_CODES = {"M", "LUDP", "LUDS"}
 HALT_REASONS = {
-    "T1": "News pending", "T2": "News released", "T3": "News and resumption times",
-    "T5": "Single stock trading pause", "T6": "Extraordinary market activity",
-    "T7": "Quotation-only period", "T8": "ETF halt", "T12": "Additional information requested",
-    "H4": "Non-compliance", "H9": "Not current in required filings", "H10": "SEC trading suspension",
-    "H11": "Regulatory concern", "O1": "Operations halt", "IPO1": "IPO not yet trading",
-    "M1": "Corporate action", "M2": "Quotation not available",
-    "M": "Volatility pause (LULD)", "LUDP": "Volatility pause (LULD)", "LUDS": "Volatility pause (LULD)",
-    "MWC1": "Market-wide circuit breaker (level 1)", "MWC2": "Market-wide circuit breaker (level 2)",
-    "MWC3": "Market-wide circuit breaker (level 3)", "D": "Security deletion",
+    "T1": "News coming — paused until it's out", "T2": "News is out — waiting to resume",
+    "T3": "News is out — resume time set", "T5": "Single-stock pause",
+    "T6": "Unusual market activity", "T7": "Quotes only, no trading yet", "T8": "ETF halt",
+    "T12": "Exchange asked the company for info",
+    "H4": "🚨 Not meeting listing rules", "H9": "🚨 Late on required reports",
+    "H10": "🚨 SEC suspended trading", "H11": "🚨 Regulator concern",
+    "O1": "Operations halt", "IPO1": "IPO not trading yet",
+    "M1": "Corporate action", "M2": "No quotes available",
+    "M": "Price moved too fast (short pause)", "LUDP": "Price moved too fast (short pause)",
+    "LUDS": "Price moved too fast (short pause)",
+    "MWC1": "Whole market halted (level 1)", "MWC2": "Whole market halted (level 2)",
+    "MWC3": "Whole market halted for the day (level 3)", "D": "🚨 Removed from the exchange",
 }
 
 HELP = (
@@ -55,8 +58,8 @@ HELP = (
     "/list — show watchlist\n"
     "/recent TICKER [N] — latest N filings (default 5, max 20)\n"
     "/dividends TICKER — dividend history (per share + total paid)\n\n"
-    "You get alerts for new SEC filings and trading halts on your watchlist. "
-    "Filings that can add new shares are marked ⚠️, filings that mention a dividend 💰."
+    "You get alerts for new SEC filings and trading halts on your watchlist.\n\n"
+    "Marks: ⚠️ dilution risk · 💰 dividend · 🔀 reverse split · 🚨 delisting risk"
 )
 COMMANDS = [
     {"command": "add", "description": "Add tickers: /add NCT AAPL"},
@@ -96,34 +99,38 @@ DIV_TOTAL = [
     ("ifrs-full", "DividendsPaid"),
 ]
 
-FORM_NAMES = {
-    "10-K": "Annual report", "10-Q": "Quarterly report", "8-K": "Current report",
-    "20-F": "Annual report (foreign issuer)", "40-F": "Annual report (Canadian issuer)",
-    "6-K": "Current report (foreign issuer)",
-    "S-1": "Registration statement", "F-1": "Registration statement (foreign issuer)",
-    "S-3": "Shelf registration", "F-3": "Shelf registration (foreign issuer)",
-    "S-4": "Merger registration", "F-4": "Merger registration (foreign issuer)",
-    "S-8": "Employee stock plan registration", "EFFECT": "Registration declared effective",
-    "3": "Initial insider ownership", "4": "Insider transaction", "5": "Annual insider ownership",
-    "144": "Notice of proposed insider sale",
-    "SC 13D": "5%+ ownership stake (active)", "SC 13G": "5%+ ownership stake (passive)",
-    "SCHEDULE 13D": "5%+ ownership stake (active)", "SCHEDULE 13G": "5%+ ownership stake (passive)",
-    "DEF 14A": "Proxy statement (shareholder meeting)", "PRE 14A": "Preliminary proxy statement",
-    "25-NSE": "Delisting notice", "NT 10-K": "Late annual report notice",
-    "NT 10-Q": "Late quarterly report notice", "NT 20-F": "Late annual report notice",
-    "CORRESP": "Company letter to SEC", "UPLOAD": "SEC letter to company", "D": "Private placement notice",
+FORM_NAMES = {  # plain-English meaning shown at the top of each alert
+    "10-K": "📘 Annual report", "10-Q": "📗 Quarterly report",
+    "20-F": "📘 Annual report", "40-F": "📘 Annual report",
+    "8-K": "📄 Company news", "6-K": "📄 Company news",
+    "S-1": "💸 Plans to sell new shares", "F-1": "💸 Plans to sell new shares",
+    "S-3": "💸 Can sell new shares anytime (shelf)", "F-3": "💸 Can sell new shares anytime (shelf)",
+    "S-4": "🤝 Merger paperwork", "F-4": "🤝 Merger paperwork",
+    "S-8": "👔 New shares for employee stock plans",
+    "EFFECT": "💸 SEC cleared a share sale — shares can be sold now",
+    "3": "👤 New insider's holdings", "4": "👤 Insider bought or sold", "5": "👤 Insider's yearly holdings",
+    "144": "👤 Insider plans to sell shares",
+    "SC 13D": "🐋 Big holder owns 5%+ (may push for changes)", "SC 13G": "🐋 Big holder owns 5%+ (passive)",
+    "SCHEDULE 13D": "🐋 Big holder owns 5%+ (may push for changes)", "SCHEDULE 13G": "🐋 Big holder owns 5%+ (passive)",
+    "DEF 14A": "🗳 Shareholder vote coming", "PRE 14A": "🗳 Draft of upcoming shareholder vote",
+    "25-NSE": "🚨 Exchange is delisting the stock", "25": "🚨 Company is delisting itself",
+    "NT 10-K": "⏰ Annual report will be late", "NT 10-Q": "⏰ Quarterly report will be late",
+    "NT 20-F": "⏰ Annual report will be late",
+    "CORRESP": "✉️ Company's reply to the SEC", "UPLOAD": "✉️ SEC questions for the company",
+    "D": "💸 Sold shares privately",
 }
 ITEMS_8K = {
-    "1.01": "Material agreement", "1.02": "Agreement terminated", "1.03": "Bankruptcy",
-    "1.05": "Cybersecurity incident", "2.01": "Acquisition or sale of assets",
-    "2.02": "Earnings / financial results", "2.03": "New debt or obligation",
-    "2.04": "Debt acceleration", "2.05": "Restructuring costs", "2.06": "Impairment",
-    "3.01": "Delisting / listing rule notice", "3.02": "Unregistered share sale",
-    "3.03": "Change to shareholder rights", "4.01": "Auditor change",
-    "4.02": "Prior financials unreliable", "5.01": "Change in control",
-    "5.02": "Director / officer change", "5.03": "Bylaws or fiscal year change",
-    "5.07": "Shareholder vote results", "7.01": "Regulation FD disclosure",
-    "8.01": "Other events",
+    "1.01": "🤝 Signed a major deal", "1.02": "✂️ Ended a major deal", "1.03": "🆘 Bankruptcy",
+    "1.05": "🔓 Cyberattack", "2.01": "🏢 Bought or sold a business / assets",
+    "2.02": "📊 Earnings results", "2.03": "💳 Took on new debt",
+    "2.04": "⚠️ Lender demands early repayment", "2.05": "✂️ Restructuring / layoffs",
+    "2.06": "📉 Wrote down asset values",
+    "3.01": "🚨 Exchange listing problem (delisting risk)", "3.02": "💸 Sold new shares privately",
+    "3.03": "⚠️ Shareholder rights changed", "4.01": "🔄 Changed auditor",
+    "4.02": "🚩 Past financials can't be trusted", "5.01": "👑 New controlling owner",
+    "5.02": "👥 Director / executive change", "5.03": "📜 Bylaws or fiscal year changed",
+    "5.07": "🗳 Shareholder vote results", "7.01": "📢 Public announcement",
+    "8.01": "📌 Other news",
 }
 
 
@@ -226,7 +233,7 @@ def clip(s, n=220):
 
 def form_label(form):
     base, amend = (form[:-2], " (amendment)") if form.endswith("/A") else (form, "")
-    name = FORM_NAMES.get(base) or ("Prospectus / offering terms" if base.startswith("424B") else "")
+    name = FORM_NAMES.get(base) or ("💸 Final offering terms — new shares priced" if base.startswith("424B") else "")
     return name + amend if name else ""
 
 
@@ -275,7 +282,7 @@ def summarize(cik, f):
         elif base == "8-K":
             codes = [c.strip() for c in (f.get("items") or "").split(",") if c.strip() and c.strip() != "9.01"]
             if codes:
-                out.append("Items: " + "; ".join(ITEMS_8K.get(c, c) for c in codes))
+                out += [ITEMS_8K.get(c, f"Item {c}") for c in codes]
             headline = exhibit_headline(cik, f)
             if headline:
                 out.append("📰 " + clip(headline))
@@ -288,21 +295,20 @@ def summarize(cik, f):
 
 
 def filing_block(cik, f, number=None):
-    head = f"{f['form']} · {f['date']}"
     label = form_label(f["form"])
-    if label:
-        head += f" · {label}"
+    code = f"{f['form']} · {f['date']}"
+    head = f"{label}\n{code}" if label else code
     if number is not None:
         head = f"{number}) {head}"
     lines = summarize(cik, f)
     base = f["form"].replace("/A", "")
     text = f.get("_text", "")
     if base in DILUTION_FORMS or base.startswith("424B") or DILUTION_WORDS.search(text):
-        lines.append("⚠️ Possible dilution: may add new shares (check the filing)")
+        lines.append("⚠️ Dilution risk — may create new shares")
     if SPLIT_WORDS.search(text):
-        lines.append("⚠️ Reverse split / share consolidation mentioned")
+        lines.append("🔀 Reverse split mentioned — fewer shares, higher price each")
     if DIVIDEND_WORDS.search(text):
-        lines.append("💰 Dividend / distribution mentioned")
+        lines.append("💰 Dividend mentioned — check the ex-date if you hold")
     return "\n".join([head] + lines)
 
 
@@ -549,7 +555,7 @@ def check_filings(state):
         for f in reversed([f for f in filings if f["acc"] not in seen]):  # send oldest first
             if f["form"] in SKIP_FORMS:
                 continue
-            send(f"🔔 New SEC filing — {t} ({w['name']})\n\n{filing_block(w['cik'], f)}\n\n{filing_url(w['cik'], f)}")
+            send(f"🔔 {t} · {w['name']}\n\n{filing_block(w['cik'], f)}\n\n🔗 {filing_url(w['cik'], f)}")
         w["seen"] = [f["acc"] for f in filings]
 
 
