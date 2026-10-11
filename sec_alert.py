@@ -22,7 +22,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 TOKEN = os.environ["TG_TOKEN"].strip()
@@ -308,6 +308,26 @@ def filing_block(cik, f, number=None):
 
 
 ANNUAL_FORMS = ("10-K", "20-F", "40-F", "10-KT")
+LISTING_FORMS = ("8-A12B", "424B4", "424B1")  # exchange registration / final IPO prospectus
+
+
+def listing_info(cik):
+    """(listing_date, traded_before) for the first exchange listing.
+
+    listing_date: date of the first exchange registration / final IPO prospectus, "" if unknown.
+    traded_before: True if the company already filed annual reports before that date
+                   (e.g. it traded OTC and later uplisted), so earlier holders could be public.
+    Only trusted when SEC returns the full filing history; long-listed companies return ("", True)."""
+    sub = sec_json(f"https://data.sec.gov/submissions/CIK{int(cik):010d}.json")["filings"]
+    if sub.get("files"):  # very long history -> listed long ago
+        return "", True
+    r = sub["recent"]
+    rows = list(zip(r["form"], r["filingDate"]))
+    listed = min((d for f, d in rows if f in LISTING_FORMS), default="")
+    if not listed:
+        return "", False
+    traded_before = any(f.split("/")[0] in ANNUAL_FORMS + ("10-Q",) and d < listed for f, d in rows)
+    return listed, traded_before
 
 
 def year_long(r):
@@ -359,40 +379,74 @@ def money(val, unit, per_share=False):
 
 def dividend_report(t, info, years=6):
     head = f"💰 Dividends — {t} ({info['name']})"
+    note = ("Annual reports only (10-K / 20-F); the current fiscal year isn't covered. "
+            "New dividend announcements show up as 💰 in filing alerts and /recent.")
     try:
         facts = sec_json(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{int(info['cik']):010d}.json").get("facts", {})
     except urllib.error.HTTPError as e:
         if e.code == 404:
-            return f"{head}\n\nNo financial data on SEC for this company (common for funds/ETFs and some small or new issuers)."
+            return f"{head}\n\n❔ No financial data on SEC (common for funds/ETFs and some small issuers). Check /recent."
         raise
     latest = latest_fiscal_year_end(facts)
     if not latest:
-        return f"{head}\n\nNo annual report data on SEC for this company, so dividend history can't be checked. Use /recent instead."
+        return f"{head}\n\n❔ No annual report data on SEC yet, so this can't be checked. Check /recent."
+    try:
+        listed, traded_before = listing_info(info["cik"])
+    except Exception as e:
+        print(f"listing info failed: {e}")
+        listed, traded_before = "", False
+    long_listed = not listed and traded_before
+
     ps, tot = annual_series(facts, DIV_PER_SHARE), annual_series(facts, DIV_TOTAL)
-    # one fiscal year end per year: the newest end seen in each ~12-month window back from the latest
     cutoff = date.fromisoformat(latest)
     ends = sorted({e for e in list(ps) + list(tot) if (cutoff - date.fromisoformat(e)).days < years * 366}, reverse=True)
-    rows, paid_years = [], 0
+
+    rows, kinds = [], {}  # kinds: end -> "public" | "private" | "unsure"
     for e in ends:
+        per_share, total = (ps.get(e) or (0, ""))[0], (tot.get(e) or (0, ""))[0]
+        if not (per_share or total):
+            continue  # reported as zero -> nothing to show
+        start = (date.fromisoformat(e) - timedelta(days=365)).isoformat()
+        if long_listed or (listed and start >= listed):
+            kinds[e], mark = "public", "✅ public got it"
+        elif listed and e < listed and not traded_before:
+            kinds[e], mark = "private", "🔒 pre-listing, public couldn't get it"
+        elif listed and e < listed:
+            kinds[e], mark = "unsure", "❓ traded OTC before listing — check"
+        elif listed:
+            kinds[e], mark = "unsure", "❓ listing year — check"
+        else:
+            kinds[e], mark = "unsure", "❓ listing date unknown — check"
         parts = [f"FY ending {e}"]
-        if e in ps:
-            parts.append(f"{money(ps[e][0], ps[e][1], True)}/share")
-        if e in tot:
-            parts.append(f"{money(tot[e][0], tot[e][1])} paid")
-        rows.append(" · ".join(parts))
-        paid_years += bool((ps.get(e) or (0,))[0] or (tot.get(e) or (0,))[0])
-    latest_paid = bool((ps.get(latest) or (0,))[0] or (tot.get(latest) or (0,))[0])
-    if latest_paid:
-        verdict = f"✅ Paid dividends in its latest fiscal year (ending {latest})."
-    elif paid_years:
-        verdict = f"⚠️ Paid dividends in the last {years} years, but nothing reported for its latest fiscal year (ending {latest})."
+        if per_share:
+            parts.append(f"{money(per_share, ps[e][1], True)}/share")
+        if total:
+            parts.append(money(total, tot[e][1]))
+        rows.append(" · ".join(parts + [mark]))
+
+    public = [e for e, k in kinds.items() if k == "public"]
+    unsure = [e for e, k in kinds.items() if k == "unsure"]
+    if kinds.get(latest) == "public":
+        verdict = f"✅ YES — public shareholders received a dividend in its latest fiscal year (ending {latest})."
+    elif public:
+        verdict = f"⚠️ YES before — public shareholders received dividends (last: FY ending {max(public)}), but none in its latest fiscal year (ending {latest})."
+    elif unsure:
+        verdict = "❓ UNCLEAR — SEC data can't tell if public holders got the payout(s) marked ❓. Check those filings."
+    elif kinds:
+        verdict = f"🔒 NO — no dividend has gone to public shareholders through its latest fiscal year (ending {latest}). Earlier payouts were before listing."
     else:
-        verdict = (f"No dividends found in the last {years} fiscal years (latest ends {latest}).\n"
-                   "Most likely it doesn't pay one, but some issuers don't tag dividend data — check /recent to be sure.")
-    body = ("\n\n" + "\n".join(rows)) if rows else ""
-    return (f"{head}\n{verdict}{body}\n\nFull-year figures from annual reports (10-K / 20-F). "
-            "The current, unfinished fiscal year isn't included — new dividend announcements show up as 💰 "
-            "in filing alerts and /recent.")
+        verdict = (f"🚫 NO — no dividends found in the last {years} fiscal years (latest ends {latest}).\n"
+                   "Some issuers don't tag dividend data, so check /recent to be 100% sure.")
+
+    lines = [head]
+    if listed:
+        lines.append(f"Listed: {listed}")
+    lines.append("")
+    lines.append(verdict)
+    if rows:
+        lines += ["", "\n".join(rows)]
+    lines += ["", note]
+    return "\n".join(lines)
 
 
 # ---------- Telegram commands ----------
