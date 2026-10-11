@@ -307,25 +307,42 @@ def filing_block(cik, f, number=None):
 
 
 
+ANNUAL_FORMS = ("10-K", "20-F", "40-F", "10-KT")
+
+
+def year_long(r):
+    if "start" not in r or "end" not in r:
+        return False
+    days = (date.fromisoformat(r["end"]) - date.fromisoformat(r["start"])).days
+    return 330 <= days <= 380  # full fiscal year, not a quarter
+
+
 def annual_series(facts, concepts):
-    """Best concept -> (unit, {fiscal_year_end: value}) using full-year figures only."""
-    best = None
+    """{fiscal_year_end: (value, unit)} merged across concepts; earlier concepts in the list win."""
+    out = {}
     for tax, name in concepts:
         node = facts.get(tax, {}).get(name)
         if not node:
             continue
+        found = {}  # end -> (filed, val, unit); a later filing (restatement) wins
         for unit, rows in node.get("units", {}).items():
-            years = {}  # end -> (filed, val); a later filing (restatement) wins
             for r in rows:
-                if "start" not in r or "end" not in r:
-                    continue
-                days = (date.fromisoformat(r["end"]) - date.fromisoformat(r["start"])).days
-                if not 330 <= days <= 380:  # skip quarters / partial periods
-                    continue
-                if r["end"] not in years or r.get("filed", "") > years[r["end"]][0]:
-                    years[r["end"]] = (r.get("filed", ""), r["val"])
-            if years and (best is None or max(years) > max(best[1])):
-                best = (unit, {e: v for e, (_, v) in years.items()})
+                if year_long(r) and (r["end"] not in found or r.get("filed", "") > found[r["end"]][0]):
+                    found[r["end"]] = (r.get("filed", ""), r["val"], unit)
+        for end, (_, val, unit) in found.items():
+            out.setdefault(end, (val, unit))
+    return out
+
+
+def latest_fiscal_year_end(facts):
+    """End date of the company's newest full fiscal year in any annual report."""
+    best = ""
+    for concepts in facts.values():
+        for node in concepts.values():
+            for rows in node.get("units", {}).values():
+                for r in rows:
+                    if r.get("form", "").split("/")[0] in ANNUAL_FORMS and r["end"] > best and year_long(r):
+                        best = r["end"]
     return best
 
 
@@ -341,39 +358,41 @@ def money(val, unit, per_share=False):
 
 
 def dividend_report(t, info, years=6):
+    head = f"💰 Dividends — {t} ({info['name']})"
     try:
         facts = sec_json(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{int(info['cik']):010d}.json").get("facts", {})
     except urllib.error.HTTPError as e:
         if e.code == 404:
-            return f"💰 Dividends — {t} ({info['name']})\n\nNo financial data on SEC for this company (common for funds/ETFs and some small or new issuers)."
+            return f"{head}\n\nNo financial data on SEC for this company (common for funds/ETFs and some small or new issuers)."
         raise
+    latest = latest_fiscal_year_end(facts)
+    if not latest:
+        return f"{head}\n\nNo annual report data on SEC for this company, so dividend history can't be checked. Use /recent instead."
     ps, tot = annual_series(facts, DIV_PER_SHARE), annual_series(facts, DIV_TOTAL)
-    ends = sorted(set((ps or (0, {}))[1]) | set((tot or (0, {}))[1]), reverse=True)[:years]
-    head = f"💰 Dividends — {t} ({info['name']})"
-    if not ends:
-        return (f"{head}\n\nNo dividends found in SEC financial data.\n"
-                "Most likely it doesn't pay one — but some foreign or small issuers don't tag this data, "
-                "so check /recent for announcements to be sure.")
-    rows = []
+    # one fiscal year end per year: the newest end seen in each ~12-month window back from the latest
+    cutoff = date.fromisoformat(latest)
+    ends = sorted({e for e in list(ps) + list(tot) if (cutoff - date.fromisoformat(e)).days < years * 366}, reverse=True)
+    rows, paid_years = [], 0
     for e in ends:
         parts = [f"FY ending {e}"]
-        if ps and e in ps[1]:
-            parts.append(f"{money(ps[1][e], ps[0], True)}/share")
-        if tot and e in tot[1]:
-            parts.append(f"{money(tot[1][e], tot[0])} paid")
+        if e in ps:
+            parts.append(f"{money(ps[e][0], ps[e][1], True)}/share")
+        if e in tot:
+            parts.append(f"{money(tot[e][0], tot[e][1])} paid")
         rows.append(" · ".join(parts))
-    paid = any(v for s in (ps, tot) if s for e, v in s[1].items() if e in ends)
-    latest = ends[0]
-    latest_paid = any(s and s[1].get(latest) for s in (ps, tot))
-    if not paid:
-        verdict = "No dividends in the last few fiscal years (reported as 0)."
-    elif latest_paid:
-        verdict = "✅ Paid dividends in its latest reported fiscal year."
+        paid_years += bool((ps.get(e) or (0,))[0] or (tot.get(e) or (0,))[0])
+    latest_paid = bool((ps.get(latest) or (0,))[0] or (tot.get(latest) or (0,))[0])
+    if latest_paid:
+        verdict = f"✅ Paid dividends in its latest fiscal year (ending {latest})."
+    elif paid_years:
+        verdict = f"⚠️ Paid dividends in the last {years} years, but nothing reported for its latest fiscal year (ending {latest})."
     else:
-        verdict = "⚠️ Paid dividends before, but nothing in its latest reported fiscal year."
-    return (f"{head}\n{verdict}\n\n" + "\n".join(rows) +
-            "\n\nFull-year figures from annual reports (10-K / 20-F). The most recent quarter isn't included — "
-            "new dividend announcements show up as 💰 in filing alerts and /recent.")
+        verdict = (f"No dividends found in the last {years} fiscal years (latest ends {latest}).\n"
+                   "Most likely it doesn't pay one, but some issuers don't tag dividend data — check /recent to be sure.")
+    body = ("\n\n" + "\n".join(rows)) if rows else ""
+    return (f"{head}\n{verdict}{body}\n\nFull-year figures from annual reports (10-K / 20-F). "
+            "The current, unfinished fiscal year isn't included — new dividend announcements show up as 💰 "
+            "in filing alerts and /recent.")
 
 
 # ---------- Telegram commands ----------
