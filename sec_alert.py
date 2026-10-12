@@ -1,12 +1,13 @@
 """SEC filing -> Telegram alert bot.
 
 Telegram commands:
-  /add NCT AAPL     add tickers (one or more)
-  /remove NCT       remove tickers
+  /add NVDA AAPL     add tickers (one or more)
+  /remove NVDA       remove tickers
   /removeall        clear the whole watchlist
   /list             show the watchlist
-  /recent NCT [N]   latest N filings with what each one is about (default 5)
-  /dividends NCT    dividend history from SEC financial data (per share + total paid)
+  /recent NVDA [N]   latest N filings with what each one is about (default 5)
+  /dividends NVDA    dividend history from SEC financial data (per share + total paid)
+  /dilution NVDA 260102 [260703]   dilution-related filings between two dates (YYMMDD; no end = today)
 
 Alerts: new SEC filings and trading halts (Nasdaq halt feed, all US exchanges) for your watchlist.
 Filings that mention a dividend are marked 💰.
@@ -30,7 +31,7 @@ CHAT_ID = os.environ["TG_CHAT_ID"].strip()
 UA = (os.environ.get("SEC_UA") or "").strip() or "sec-alert bot contact@example.com"  # SEC requires a User-Agent with contact info
 STATE = Path("state.json")
 SKIP_FORMS = set()  # filing types you don't want alerts for. e.g. {"4", "144"}
-MENU_VERSION = 5  # bump when COMMANDS change so Telegram's menu gets refreshed
+MENU_VERSION = 6  # bump when COMMANDS change so Telegram's menu gets refreshed
 HALTS_URL = "https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts"
 # Halt types you don't want alerts for. Default: skip the short automatic volatility pauses (usually 5 minutes).
 # Remove codes from this set to get those too.
@@ -57,17 +58,19 @@ HELP = (
     "/removeall — clear the watchlist\n"
     "/list — show watchlist\n"
     "/recent TICKER [N] — latest N filings (default 5, max 20)\n"
-    "/dividends TICKER — dividend history (per share + total paid)\n\n"
+    "/dividends TICKER — dividend history (per share + total paid)\n"
+    "/dilution TICKER YYMMDD [YYMMDD] — dilution filings in a date range (no end = today)\n\n"
     "You get alerts for new SEC filings and trading halts on your watchlist.\n\n"
     "Marks: ⚠️ dilution risk · 💰 dividend · 🔀 reverse split · 🚨 delisting risk"
 )
 COMMANDS = [
-    {"command": "add", "description": "Add tickers: /add NCT AAPL"},
-    {"command": "remove", "description": "Remove tickers: /remove NCT"},
+    {"command": "add", "description": "Add tickers: /add NVDA AAPL"},
+    {"command": "remove", "description": "Remove tickers: /remove NVDA"},
     {"command": "removeall", "description": "Clear the whole watchlist"},
     {"command": "list", "description": "Show watchlist"},
-    {"command": "recent", "description": "Latest filings: /recent NCT 5"},
+    {"command": "recent", "description": "Latest filings: /recent NVDA 5"},
     {"command": "dividends", "description": "Dividend history: /dividends AAPL"},
+    {"command": "dilution", "description": "Dilution filings: /dilution NVDA 260102 260703"},
 ]
 
 # ---------- Dilution / share-count warning ----------
@@ -455,6 +458,29 @@ def dividend_report(t, info, years=6):
     return "\n".join(lines)
 
 
+# ---------- Dilution check for a date range ----------
+def parse_yymmdd(s):
+    """'261012' -> date(2026, 10, 12). Raises ValueError if the format is wrong."""
+    if len(s) != 6 or not s.isdigit():
+        raise ValueError(s)
+    return date(2000 + int(s[:2]), int(s[2:4]), int(s[4:6]))
+
+
+def dilution_report(t, info, start, end):
+    """Only the dilution-related filings filed between start and end (inclusive)."""
+    filings = [f for f in recent_filings(info["cik"], 1000) if start.isoformat() <= f["date"] <= end.isoformat()]
+    hits = []
+    for f in reversed(filings):  # oldest first
+        block = filing_block(info["cik"], f)
+        if "Dilution risk" in block:
+            hits.append(f"{block}\n🔗 {filing_url(info['cik'], f)}")
+    head = (f"⚠️ Dilution check — {t} ({info['name']})\n"
+            f"{start:%y%m%d} → {end:%y%m%d} · {len(filings)} filing(s) checked")
+    if not hits:
+        return head + "\n\n✅ No dilution-related filings in this period."
+    return head + f"\n\n🚩 {len(hits)} dilution-related filing(s):\n\n" + "\n\n".join(hits)
+
+
 # ---------- Telegram commands ----------
 def handle_commands(state):
     watch = state["watch"]
@@ -514,7 +540,7 @@ def run_command(watch, cmd, args):
 
     elif cmd == "/list":
         if not watch:
-            send("📋 Your watchlist is empty.\n\nAdd tickers with /add NCT AAPL")
+            send("📋 Your watchlist is empty.\n\nAdd tickers with /add NVDA AAPL")
         else:
             rows = [f"{t} · {w.get('exchange', '?')}\n{w['name']}" for t, w in sorted(watch.items())]
             send(f"📋 Your watchlist — {len(watch)} ticker(s)\nYou'll get an alert when any of these files something new.\n\n" + "\n\n".join(rows))
@@ -536,6 +562,22 @@ def run_command(watch, cmd, args):
             send(f"{t}: not found on SEC — check the ticker")
             return
         send(dividend_report(t, info))
+
+    elif cmd == "/dilution" and len(args) >= 2:
+        t = args[0]
+        try:
+            start = parse_yymmdd(args[1])
+            end = parse_yymmdd(args[2]) if len(args) > 2 else date.today()
+        except ValueError:
+            send("Dates must be YYMMDD, e.g. /dilution NVDA 260102 260703")
+            return
+        if start > end:
+            start, end = end, start
+        info = watch.get(t) or lookup(t)
+        if not info:
+            send(f"{t}: not found on SEC — check the ticker")
+            return
+        send(dilution_report(t, info, start, end))
 
     else:
         send(HELP)
