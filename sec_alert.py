@@ -504,6 +504,8 @@ LISTING_CONTEXT = re.compile(
     r"(?i)nasdaq|nyse|listing|bid price|(stockholders|shareholders)['’]? equity|market value|\b5\d{3}\(|\b80[23]\.0"
 )
 CONDITIONAL = re.compile(r"(?i)\b(if|unless|until|whether|in the event|no assurance)\b")
+# Warning letters say the company "may be eligible for an additional 180 days" -> that's not an extension yet.
+MAYBE = re.compile(r"(?i)\b(if|unless|whether|in the event|may|eligib\w*|no assurance)\b")
 # Checked in this order: the first kind with a matching sentence wins.
 LISTING_PATTERNS = [
     ("resolved", re.compile(
@@ -548,6 +550,7 @@ DELIST_KINDS = {  # what each event means, in plain English
     "decision": "🚨 Exchange decided to delist — company can appeal",
     "resolved": "✅ Fixed — back in compliance",
     "transfer": "🔁 Moved to another market tier (often to buy time to fix a problem)",
+    "split": "🔀 Reverse split — usually done to get the price back above $1",
     "delist": "🚨 Exchange filed to remove the stock (Form 25-NSE)",
     "selfdelist": "🚪 Company filed to delist itself (Form 25)",
     "switch": "🔁 Switched exchange — not a real delisting",
@@ -563,7 +566,9 @@ def listing_status(text, title=""):
     text = ITEM_301_TITLE.sub(" ", text or "")
     sentences = [s for s in re.split(r"(?<=[.;!?])\s+", f"{title}. {text}") if LISTING_CONTEXT.search(s)]
     for kind, pattern in LISTING_PATTERNS:
-        hits = [s for s in sentences if pattern.search(s) and not (kind in ("resolved", "decision") and CONDITIONAL.search(s))]
+        hits = [s for s in sentences if pattern.search(s)
+                and not (kind in ("resolved", "decision") and CONDITIONAL.search(s))
+                and not (kind == "extension" and MAYBE.search(s))]
         if hits:
             joined = " ".join(hits)
             reasons = [k for k, rx, _ in LISTING_REASONS if rx.search(joined)]
@@ -647,6 +652,8 @@ def delisting_events(cik, filings):
             kind, reasons, _ = listing_status(text, title)
             if not kind and "3.01" in items:  # Item 3.01 is a listing problem by definition
                 kind = "warning"
+            if kind == "warning" and SPLIT_WORDS.search(title or text[:3000]):  # the fix for a low price, not a new warning
+                kind, reasons = "split", ["price"]
             if kind:
                 ev.update(kind=kind, reasons=reasons, title=title,
                           deadline=find_deadline([text], f["date"]) if kind in ("warning", "extension") else "")
@@ -664,6 +671,8 @@ def track_issues(events):
                 open_issues[r] = {**e, "since": prev.get("since", e["date"]),
                                   "deadline": e["deadline"] or (prev.get("deadline", "") if e["kind"] != "decision" else ""),
                                   "decided": prev.get("decided") or e["kind"] == "decision"}
+        elif e["kind"] == "split" and "price" in open_issues:
+            open_issues["price"]["split"] = e["date"]
         elif e["kind"] == "resolved":
             keys = [r for r in e["reasons"] if r in open_issues]
             for r in (keys + ["other"]) if keys else list(open_issues):
@@ -694,9 +703,17 @@ def delisting_report(t, info):
     elif stopped:
         verdict = f"📴 STOPPED REPORTING — filed Form 15 on {stopped[-1]['date']}. Usually means it left the exchange or is going dark."
     elif open_issues:
-        decided = any(e["decided"] for e in open_issues.values())
-        verdict = ("🚨 AT RISK — the exchange has decided to delist; the company is appealing or running out of time."
-                   if decided else "⚠️ ONGOING — the exchange warned the company and no 'fixed' filing has come out yet.")
+        # An old warning with no delist decision a month after its deadline was most likely fixed without an announcement:
+        # if it weren't, the exchange would have sent a delist decision, and that has to be filed.
+        stale = {r for r, e in open_issues.items() if not e["decided"] and (
+            (e["deadline"] and e["deadline"] < (today - timedelta(days=30)).isoformat()) or (today - date.fromisoformat(e["date"])).days > 365)}
+        if any(e["decided"] for e in open_issues.values()):
+            verdict = "🚨 AT RISK — the exchange has decided to delist; the company is appealing or running out of time."
+        elif stale == set(open_issues):
+            verdict = ("❔ PROBABLY FINE — got an exchange warning, but the deadline passed with no delist decision filed, "
+                       "so it isn't being delisted. Companies often don't announce the fix.")
+        else:
+            verdict = "⚠️ ONGOING — the exchange warned the company and no 'fixed' filing has come out yet."
         rows = []
         for r, e in open_issues.items():
             row = f"• {REASON_NAMES.get(r, r)} — since {e['since']}"
@@ -704,8 +721,10 @@ def delisting_report(t, info):
                 row += f" · deadline {e['deadline']}"
             if e["decided"]:
                 row += " · 🚨 delist decision"
-            if (today - date.fromisoformat(e["date"])).days > 365:
-                row += "\n   (over a year old — may have been fixed quietly; check the latest 10-K / 10-Q / 20-F)"
+            if e.get("split"):
+                row += f"\n   (reverse split on {e['split']} — price likely back above $1)"
+            if r in stale:
+                row += "\n   (deadline passed with no delist decision — likely fixed quietly)"
             rows.append(row)
         verdict += "\n" + "\n".join(rows)
         if fixed:
