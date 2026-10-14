@@ -13,13 +13,19 @@ Telegram commands:
 Alerts: new SEC filings and trading halts (Nasdaq halt feed, all US exchanges) for your watchlist.
 Filings that mention a dividend are marked 💰.
 
-Run periodically by GitHub Actions: handle commands -> check filings -> check halts -> save state.json.
+Run periodically by GitHub Actions: handle commands -> check filings -> check halts -> save state.
+The repo is public, so the state (your watchlist) is saved encrypted in state.enc with the STATE_KEY secret,
+and logs never name tickers, filings or chats.
 No external packages (Python standard library only).
 """
+import base64
+import hashlib
+import hmac
 import html
 import json
 import os
 import re
+import secrets
 import time
 import urllib.error
 import urllib.parse
@@ -30,7 +36,9 @@ from pathlib import Path
 TOKEN = os.environ["TG_TOKEN"].strip()
 CHAT_ID = os.environ["TG_CHAT_ID"].strip()
 UA = (os.environ.get("SEC_UA") or "").strip() or "sec-alert bot contact@example.com"  # SEC requires a User-Agent with contact info
-STATE = Path("state.json")
+STATE_KEY = (os.environ.get("STATE_KEY") or "").strip()  # without it, state is saved unencrypted in state.json
+PLAIN_STATE = Path("state.json")
+SECRET_STATE = Path("state.enc")
 SKIP_FORMS = set()  # filing types you don't want alerts for. e.g. {"4", "144"}
 MENU_VERSION = 7  # bump when COMMANDS change so Telegram's menu gets refreshed
 HALTS_URL = "https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts"
@@ -140,6 +148,11 @@ ITEMS_8K = {
 }
 
 
+def why(e):
+    """Short error text for the public log: the error type (and HTTP code), never URLs or tickers."""
+    return f"{type(e).__name__} {e.code}" if isinstance(e, urllib.error.HTTPError) else type(e).__name__
+
+
 # ---------- HTTP ----------
 def sec_get(url):
     time.sleep(0.2)  # SEC limit: 10 requests/second
@@ -187,7 +200,7 @@ def lookup(ticker):
             for cik, name, tk, exch in raw["data"]:
                 _tickers[tk.upper()] = {"cik": cik, "name": name, "exchange": exch or "?"}
         except Exception as e:
-            print(f"exchange list failed: {e}")
+            print(f"exchange list failed: {why(e)}")
         if not _tickers:  # fallback list without exchange names
             raw = sec_json("https://www.sec.gov/files/company_tickers.json")
             for v in raw.values():
@@ -301,7 +314,7 @@ def summarize(cik, f):
                 out.append("📰 " + clip(headline))
             f["_text"] = headline + (" private placement" if "3.02" in codes else "")
     except Exception as e:
-        print(f"summary failed for {f['acc']}: {e}")
+        print(f"summary failed: {why(e)}")
     if not out and f.get("desc") and f["desc"].upper() not in (f["form"].upper(), base.upper()):
         out.append(clip(f["desc"]))
     return out
@@ -417,7 +430,7 @@ def dividend_report(t, info, years=6):
     try:
         listed, traded_before = listing_info(info["cik"])
     except Exception as e:
-        print(f"listing info failed: {e}")
+        print(f"listing info failed: {why(e)}")
         listed, traded_before = "", False
     long_listed = not listed and traded_before
 
@@ -630,7 +643,7 @@ def delisting_events(cik, filings):
             try:
                 cls = delisted_class(cik, f)
             except Exception as e:
-                print(f"form 25 read failed for {f['acc']}: {e}")
+                print(f"form 25 read failed: {why(e)}")
                 cls = ""
             if cls:
                 ev.update(kind="partial", cls=cls)
@@ -647,7 +660,7 @@ def delisting_events(cik, filings):
             try:
                 text, title = listing_text(cik, f)
             except Exception as e:
-                print(f"listing text failed for {f['acc']}: {e}")
+                print(f"listing text failed: {why(e)}")
                 text, title = "", ""
             kind, reasons, _ = listing_status(text, title)
             if not kind and "3.01" in items:  # Item 3.01 is a listing problem by definition
@@ -878,7 +891,7 @@ def check_filings(state):
                 w["exchange"] = (lookup(t) or {}).get("exchange", "?")
             filings = recent_filings(w["cik"])
         except Exception as e:  # one ticker failing shouldn't stop the rest
-            print(f"{t}: {e}")
+            print(f"a watchlist check failed: {why(e)}")
             continue
         seen = set(w["seen"])
         for f in reversed([f for f in filings if f["acc"] not in seen]):  # send oldest first
@@ -918,7 +931,7 @@ def check_halts(state):
     try:
         halts = fetch_halts()
     except Exception as e:  # halt feed down -> just try again next run
-        print(f"halt feed failed: {e}")
+        print(f"halt feed failed: {why(e)}")
         return
     known = state.setdefault("halts", {})  # key -> True once "resumed" has been reported
     recent = {time.strftime("%m/%d/%Y", time.gmtime(time.time() - d * 86400)) for d in range(3)}
@@ -948,15 +961,67 @@ def check_halts(state):
             del known[key]
 
 
+# ---------- Encrypted state ----------
+# Standard library only: SHA-256 keystream (counter mode) + HMAC-SHA256 to detect a wrong key or tampering.
+def state_keys():
+    k = hashlib.sha256(STATE_KEY.encode()).digest()
+    return hashlib.sha256(b"enc" + k).digest(), hashlib.sha256(b"mac" + k).digest()
+
+
+def keystream_xor(key, nonce, data):
+    stream = b"".join(hashlib.sha256(key + nonce + i.to_bytes(8, "big")).digest() for i in range((len(data) + 31) // 32))
+    return bytes(a ^ b for a, b in zip(data, stream))
+
+
+def encrypt(data):
+    enc_key, mac_key = state_keys()
+    nonce = secrets.token_bytes(16)
+    body = nonce + keystream_xor(enc_key, nonce, data)
+    return base64.b64encode(body + hmac.new(mac_key, body, hashlib.sha256).digest()).decode() + "\n"
+
+
+def decrypt(text):
+    enc_key, mac_key = state_keys()
+    raw = base64.b64decode(text)
+    body, tag = raw[:-32], raw[-32:]
+    if not hmac.compare_digest(tag, hmac.new(mac_key, body, hashlib.sha256).digest()):
+        raise SystemExit("state.enc can't be opened: the STATE_KEY secret is wrong or was changed")
+    return keystream_xor(enc_key, body[:16], body[16:])
+
+
+def load_state():
+    if SECRET_STATE.exists():
+        if not STATE_KEY:  # never start over with an empty watchlist just because the secret is missing
+            raise SystemExit("state.enc exists but the STATE_KEY secret is missing")
+        return json.loads(decrypt(SECRET_STATE.read_text()))
+    if PLAIN_STATE.exists():
+        return json.loads(PLAIN_STATE.read_text())
+    return {"offset": 0, "watch": {}}
+
+
+def save_state(state):
+    data = (json.dumps(state, indent=1, ensure_ascii=False, sort_keys=True) + "\n").encode()
+    if not STATE_KEY:
+        PLAIN_STATE.write_bytes(data)
+        return
+    # Encryption is random each time, so only rewrite when something changed (no commit every run).
+    if not SECRET_STATE.exists() or decrypt(SECRET_STATE.read_text()) != data:
+        SECRET_STATE.write_text(encrypt(data))
+    PLAIN_STATE.unlink(missing_ok=True)  # first run with the key: drop the readable copy
+
+
 def main():
-    state = json.loads(STATE.read_text()) if STATE.exists() else {"offset": 0, "watch": {}}
+    state = load_state()
     handle_commands(state)
     check_filings(state)
     check_halts(state)
     # guarantees a commit at least monthly, so GitHub doesn't disable the schedule after 60 idle days
     state["heartbeat"] = time.strftime("%Y-%m")
-    STATE.write_text(json.dumps(state, indent=1, ensure_ascii=False, sort_keys=True) + "\n")
+    save_state(state)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:  # the default traceback could print a ticker or URL in the public log
+        raise SystemExit(f"run failed: {why(e)}")
