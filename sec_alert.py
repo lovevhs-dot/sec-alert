@@ -8,6 +8,7 @@ Telegram commands:
   /recent NVDA [N]   latest N filings with what each one is about (default 5)
   /dividends NVDA    dividend history from SEC financial data (per share + total paid)
   /dilution NVDA 260102 [260703]   dilution-related filings between two dates (YYMMDD; no end = today)
+  /delisting NVDA    delisting status: warned / scheduled / delisted / fixed, from SEC filings
 
 Alerts: new SEC filings and trading halts (Nasdaq halt feed, all US exchanges) for your watchlist.
 Filings that mention a dividend are marked 💰.
@@ -31,7 +32,7 @@ CHAT_ID = os.environ["TG_CHAT_ID"].strip()
 UA = (os.environ.get("SEC_UA") or "").strip() or "sec-alert bot contact@example.com"  # SEC requires a User-Agent with contact info
 STATE = Path("state.json")
 SKIP_FORMS = set()  # filing types you don't want alerts for. e.g. {"4", "144"}
-MENU_VERSION = 6  # bump when COMMANDS change so Telegram's menu gets refreshed
+MENU_VERSION = 7  # bump when COMMANDS change so Telegram's menu gets refreshed
 HALTS_URL = "https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts"
 # Halt types you don't want alerts for. Default: skip the short automatic volatility pauses (usually 5 minutes).
 # Remove codes from this set to get those too.
@@ -59,7 +60,8 @@ HELP = (
     "/list — show watchlist\n"
     "/recent TICKER [N] — latest N filings (default 5, max 20)\n"
     "/dividends TICKER — dividend history (per share + total paid)\n"
-    "/dilution TICKER YYMMDD [YYMMDD] — dilution filings in a date range (no end = today)\n\n"
+    "/dilution TICKER YYMMDD [YYMMDD] — dilution filings in a date range (no end = today)\n"
+    "/delisting TICKER — delisting status: warned, scheduled, delisted or fixed\n\n"
     "You get alerts for new SEC filings and trading halts on your watchlist.\n\n"
     "Marks: ⚠️ dilution risk · 💰 dividend · 🔀 reverse split · 🚨 delisting risk"
 )
@@ -71,6 +73,7 @@ COMMANDS = [
     {"command": "recent", "description": "Latest filings: /recent NVDA 5"},
     {"command": "dividends", "description": "Dividend history: /dividends AAPL"},
     {"command": "dilution", "description": "Dilution filings: /dilution NVDA 260102 260703"},
+    {"command": "delisting", "description": "Delisting status: /delisting NVDA"},
 ]
 
 # ---------- Dilution / share-count warning ----------
@@ -240,16 +243,23 @@ def form_label(form):
     return name + amend if name else ""
 
 
-def exhibit_headline(cik, f):
-    """Headline of the first Exhibit 99 document (usually the press release)."""
+def exhibit99_docs(cik, f):
+    """File names of the Exhibit 99 documents (press releases etc.), sorted."""
     idx = sec_json(folder_url(cik, f) + "index.json")["directory"]["item"]
-    names = [i["name"] for i in idx if re.search(r"ex-?_?99", i["name"], re.I) and i["name"].lower().endswith((".htm", ".html"))]
-    if not names:
-        return ""
-    for line in html_lines(sec_get(folder_url(cik, f) + sorted(names)[0]))[:15]:
+    return sorted(i["name"] for i in idx if re.search(r"ex-?_?99", i["name"], re.I) and i["name"].lower().endswith((".htm", ".html")))
+
+
+def headline_of(lines):
+    for line in lines[:15]:
         if len(line) >= 15 and not re.match(r"(?i)(exhibit|ex-?99|press release$|for immediate release)", line):
             return line
     return ""
+
+
+def exhibit_headline(cik, f):
+    """Headline of the first Exhibit 99 document (usually the press release)."""
+    names = exhibit99_docs(cik, f)
+    return headline_of(html_lines(sec_get(folder_url(cik, f) + names[0]))) if names else ""
 
 
 def summarize(cik, f):
@@ -312,6 +322,11 @@ def filing_block(cik, f, number=None):
         lines.append("🔀 Reverse split mentioned — fewer shares, higher price each")
     if DIVIDEND_WORDS.search(text):
         lines.append("💰 Dividend mentioned — check the ex-date if you hold")
+    kind = listing_status(text)[0]
+    if kind == "resolved":
+        lines.append("✅ Listing problem fixed — back in compliance")
+    elif kind in ("warning", "decision", "extension") and "3.01" not in (f.get("items") or ""):
+        lines.append("🚨 Delisting risk — exchange listing problem")
     return "\n".join([head] + lines)
 
 
@@ -481,6 +496,251 @@ def dilution_report(t, info, start, end):
     return head + f"\n\n🚩 {len(hits)} dilution-related filing(s):\n\n" + "\n\n".join(hits)
 
 
+# ---------- Delisting check ----------
+DELIST_YEARS = 3       # how far back /delisting looks
+DELIST_MAX_READ = 60   # max 8-K / 6-K filings whose text is read (newest first), to keep the run short
+ITEM_301_TITLE = re.compile(r"(?i)notice of delisting or failure to satisfy a continued listing rule or standard;? (and )?transfer of listing")
+LISTING_CONTEXT = re.compile(
+    r"(?i)nasdaq|nyse|listing|bid price|(stockholders|shareholders)['’]? equity|market value|\b5\d{3}\(|\b80[23]\.0"
+)
+CONDITIONAL = re.compile(r"(?i)\b(if|unless|until|whether|in the event|no assurance)\b")
+# Checked in this order: the first kind with a matching sentence wins.
+LISTING_PATTERNS = [
+    ("resolved", re.compile(
+        r"(?i)\bregained (full )?compliance|\bhas regained\b|\bregains compliance\b|\b(is|was) (now|again) in compliance\b|"
+        r"\breturned to compliance\b|\bmatter (is|has been|was) (now )?closed\b|"
+        r"\bconfirm\w* (that )?the company (had |has )?(regained|evidenced|demonstrated) compliance")),
+    ("decision", re.compile(
+        r"(?i)delisting determination|determined to delist|determination to delist|proceedings to delist|"
+        r"commence\w* (delisting )?proceedings|will be suspended|requested a hearing|request for a hearing|"
+        r"hearing (is |was |has been )?scheduled|(will|to) be delisted|suspend\w* trading")),
+    ("extension", re.compile(
+        r"(?i)additional (180|\d+)[- ]calendar[- ]day|second (180|compliance period)|"
+        r"(granted|approved) (the company['’]?s? )?(request for )?(an |a )?(extension|exception)|extended .{0,40}deadline")),
+    ("warning", re.compile(
+        r"(?i)deficiency|notification letter|notice letter|written notice|not in compliance|non-?compliance|"
+        r"no longer (in compliance|compl\w+|satisf\w+|meets?)|did not (comply|meet|satisfy)|fail\w* to (satisfy|comply|meet|timely)|"
+        r"below (the )?(minimum|continued listing)|(below|less than) \$1\.00")),
+    ("transfer", re.compile(
+        r"(?i)transfer\w* (of )?(the |its )?(listing|securities|common stock|ordinary shares|shares|american depositary shares)\b|"
+        r"\bto transfer\b.{0,60}(capital market|global market|nyse|nasdaq)")),
+]
+LISTING_REASONS = [  # (key, pattern, plain-English reason)
+    ("price", re.compile(r"(?i)bid price|\$1\.00|average closing price|5550\(a\)\(2\)|5450\(a\)\(1\)|802\.01c"), "Share price under $1"),
+    ("equity", re.compile(r"(?i)(stockholders|shareholders)['’]? equity|5550\(b\)\(1\)|5450\(b\)\(1\)"), "Shareholders' equity too low"),
+    ("mvls", re.compile(r"(?i)market value of listed securities|\bMVLS\b|5550\(b\)\(2\)|5450\(b\)\(2\)"), "Company's total market value too low"),
+    ("public", re.compile(r"(?i)publicly held shares|\bMVPHS\b|round lot|total holders|5550\(a\)\([345]\)"), "Not enough shares / holders in public hands"),
+    ("mcap", re.compile(r"(?i)market capitali[sz]ation|802\.01b"), "Market cap too low"),
+    ("reports", re.compile(r"(?i)5250\(c\)|periodic (financial )?reports?|timely fil|delinquen|form 10-[kq]\b|form 20-f|802\.01e"), "Late on financial reports"),
+    ("governance", re.compile(r"(?i)audit committee|independent directors?|5605"), "Board / audit committee rule broken"),
+    ("meeting", re.compile(r"(?i)annual (general |shareholders['’]? |stockholders['’]? )?meeting|5620\(a\)"), "Missed the annual shareholder meeting"),
+    ("interest", re.compile(r"(?i)public interest|5101"), "Exchange has public-interest concerns"),
+]
+REASON_NAMES = {k: name for k, _, name in LISTING_REASONS}
+REASON_NAMES["other"] = "Listing rule (reason not clear from the filing)"
+MONTHS = ["January", "February", "March", "April", "May", "June", "July",
+          "August", "September", "October", "November", "December"]
+MONTH_DATE = r"(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),?\s+(\d{4})"
+DEADLINE = re.compile(rf"(?i)\b(?:until|by|through|before|expir\w* on)\s+(?:on\s+)?{MONTH_DATE}")
+DELIST_KINDS = {  # what each event means, in plain English
+    "warning": "⚠️ Exchange warning — not meeting a listing rule (not delisted yet)",
+    "extension": "⏳ Got more time to fix the problem",
+    "decision": "🚨 Exchange decided to delist — company can appeal",
+    "resolved": "✅ Fixed — back in compliance",
+    "transfer": "🔁 Moved to another market tier (often to buy time to fix a problem)",
+    "delist": "🚨 Exchange filed to remove the stock (Form 25-NSE)",
+    "selfdelist": "🚪 Company filed to delist itself (Form 25)",
+    "switch": "🔁 Switched exchange — not a real delisting",
+    "partial": "ℹ️ Only {cls} removed — the main shares are not affected",
+    "deregister": "📴 Company stopped reporting to the SEC (Form 15)",
+}
+
+
+def listing_status(text, title=""):
+    """What a filing says about the exchange listing.
+
+    Returns (kind, reason keys, matching sentences); kind is "" when the filing isn't about listing."""
+    text = ITEM_301_TITLE.sub(" ", text or "")
+    sentences = [s for s in re.split(r"(?<=[.;!?])\s+", f"{title}. {text}") if LISTING_CONTEXT.search(s)]
+    for kind, pattern in LISTING_PATTERNS:
+        hits = [s for s in sentences if pattern.search(s) and not (kind in ("resolved", "decision") and CONDITIONAL.search(s))]
+        if hits:
+            joined = " ".join(hits)
+            reasons = [k for k, rx, _ in LISTING_REASONS if rx.search(joined)]
+            if "equity" in reasons and "mvls" in reasons:  # letters list the alternatives too -> keep the one named first
+                eq, mv = (re.search(rx, joined).start() for k, rx, _ in LISTING_REASONS if k in ("equity", "mvls"))
+                reasons.remove("mvls" if eq < mv else "equity")
+            return kind, reasons, hits
+    return "", [], []
+
+
+def find_deadline(texts, filed):
+    """First 'until / by <Month D, YYYY>' date after the filing date, as YYYY-MM-DD ('' if none)."""
+    for s in texts:
+        for m in DEADLINE.finditer(s):
+            try:
+                d = date(int(m.group(3)), MONTHS.index(m.group(1).capitalize()) + 1, int(m.group(2))).isoformat()
+            except ValueError:
+                continue
+            if d > filed:
+                return d
+    return ""
+
+
+def listing_text(cik, f):
+    """(text, headline) of an 8-K / 6-K: main document plus its press releases if it looks listing-related."""
+    main = " ".join(html_lines(sec_get(filing_url(cik, f)))) if f["doc"] else ""
+    texts, title = [main[:20000]], ""
+    if LISTING_CONTEXT.search(main) or re.search(r"(?i)press release|exhibit 99", main):
+        for name in exhibit99_docs(cik, f)[:2]:
+            lines = html_lines(sec_get(folder_url(cik, f) + name))
+            title = title or headline_of(lines)
+            texts.append(" ".join(lines)[:20000])
+    return " ".join(texts), title
+
+
+def delisted_class(cik, f):
+    """Class a Form 25 removes, e.g. 'Warrants'. '' means the main shares (or unknown)."""
+    doc = re.sub(r"^xsl[^/]*/", "", f["doc"] or "")  # raw XML instead of SEC's rendered page
+    raw = sec_get(folder_url(cik, f) + doc).decode("utf-8", "replace")
+    m = re.search(r"(?is)<(\w*class\w*)>(.*?)</\1>", raw) or re.search(r"(?i)class of securities\W{0,20}(.{0,120})", raw)
+    desc = html.unescape(re.sub(r"<[^>]+>", " ", m.group(m.lastindex))) if m else ""
+    main = re.search(r"(?i)common (stock|shares)|ordinary shares|american depositary|class [a-c] (common|ordinary)", desc)
+    side = re.search(r"(?i)warrants?|notes?|debentures?|preferred|units?|rights|bonds?|depositary shares", desc)
+    if side and (not main or side.start() < main.start()):
+        return side.group(0).capitalize()
+    return ""
+
+
+def delisting_events(cik, filings):
+    """Listing-related events, oldest first, plus how many 8-K / 6-K were left unread (cap)."""
+    events, read, skipped = [], 0, 0
+    exchange_regs = [x["date"] for x in filings if x["form"] == "8-A12B"]
+    for f in filings:  # newest first, so the read cap drops the oldest
+        form = f["form"].replace("/A", "")
+        items = {c.strip() for c in (f.get("items") or "").split(",")}
+        ev = {"date": f["date"], "form": f["form"], "url": filing_url(cik, f), "reasons": [], "deadline": "", "title": ""}
+        if form in ("25-NSE", "25"):
+            near = [d for d in exchange_regs if abs((date.fromisoformat(d) - date.fromisoformat(f["date"])).days) <= 30]
+            try:
+                cls = delisted_class(cik, f)
+            except Exception as e:
+                print(f"form 25 read failed for {f['acc']}: {e}")
+                cls = ""
+            if cls:
+                ev.update(kind="partial", cls=cls)
+            else:
+                ev["kind"] = "switch" if near else ("delist" if form == "25-NSE" else "selfdelist")
+            events.append(ev)
+        elif form.startswith(("15-", "15F-")):
+            events.append({**ev, "kind": "deregister"})
+        elif form == "6-K" or (form == "8-K" and items & {"3.01", "7.01", "8.01"}):
+            if read >= DELIST_MAX_READ:
+                skipped += 1
+                continue
+            read += 1
+            try:
+                text, title = listing_text(cik, f)
+            except Exception as e:
+                print(f"listing text failed for {f['acc']}: {e}")
+                text, title = "", ""
+            kind, reasons, _ = listing_status(text, title)
+            if not kind and "3.01" in items:  # Item 3.01 is a listing problem by definition
+                kind = "warning"
+            if kind:
+                ev.update(kind=kind, reasons=reasons, title=title,
+                          deadline=find_deadline([text], f["date"]) if kind in ("warning", "extension") else "")
+                events.append(ev)
+    return list(reversed(events)), skipped
+
+
+def track_issues(events):
+    """Replay events oldest first -> (open issues {reason: event}, list of 'resolved' events)."""
+    open_issues, fixed = {}, []
+    for e in events:
+        if e["kind"] in ("warning", "decision", "extension"):
+            for r in e["reasons"] or list(open_issues) or ["other"]:
+                prev = open_issues.get(r, {})
+                open_issues[r] = {**e, "since": prev.get("since", e["date"]),
+                                  "deadline": e["deadline"] or (prev.get("deadline", "") if e["kind"] != "decision" else ""),
+                                  "decided": prev.get("decided") or e["kind"] == "decision"}
+        elif e["kind"] == "resolved":
+            keys = [r for r in e["reasons"] if r in open_issues]
+            for r in (keys + ["other"]) if keys else list(open_issues):
+                open_issues.pop(r, None)
+            fixed.append(e)
+    return open_issues, fixed
+
+
+def delisting_report(t, info):
+    today = date.today()
+    since = (today - timedelta(days=DELIST_YEARS * 365)).isoformat()
+    filings = [f for f in recent_filings(info["cik"], 1000) if f["date"] >= since]
+    events, skipped = delisting_events(info["cik"], filings)
+    exchange = info.get("exchange") or "?"
+
+    main = [e for e in events if e["kind"] in ("delist", "selfdelist")]
+    stopped = [e for e in events if e["kind"] == "deregister"]
+    open_issues, fixed = track_issues(events)
+    if main:
+        e = main[-1]
+        effective = date.fromisoformat(e["date"]) + timedelta(days=10)  # Form 25 takes effect 10 days after filing
+        who = "The exchange" if e["kind"] == "delist" else "The company itself"
+        if effective > today:
+            verdict = f"🚨 DELISTING SCHEDULED — {who} filed to remove the stock on {e['date']}. It takes effect around {effective}."
+        else:
+            verdict = f"🚨 DELISTED — {who} filed to remove the stock on {e['date']}; removed around {effective}."
+        verdict += "\n(This also happens after a buyout/merger, so check the latest news.)"
+    elif stopped:
+        verdict = f"📴 STOPPED REPORTING — filed Form 15 on {stopped[-1]['date']}. Usually means it left the exchange or is going dark."
+    elif open_issues:
+        decided = any(e["decided"] for e in open_issues.values())
+        verdict = ("🚨 AT RISK — the exchange has decided to delist; the company is appealing or running out of time."
+                   if decided else "⚠️ ONGOING — the exchange warned the company and no 'fixed' filing has come out yet.")
+        rows = []
+        for r, e in open_issues.items():
+            row = f"• {REASON_NAMES.get(r, r)} — since {e['since']}"
+            if e["deadline"]:
+                row += f" · deadline {e['deadline']}"
+            if e["decided"]:
+                row += " · 🚨 delist decision"
+            if (today - date.fromisoformat(e["date"])).days > 365:
+                row += "\n   (over a year old — may have been fixed quietly; check the latest 10-K / 10-Q / 20-F)"
+            rows.append(row)
+        verdict += "\n" + "\n".join(rows)
+        if fixed:
+            verdict += f"\nEarlier problems were fixed (last fix: {fixed[-1]['date']})."
+    elif fixed:
+        verdict = f"✅ RESOLVED — had an exchange listing problem, but it was fixed (last fix: {fixed[-1]['date']})."
+    else:
+        verdict = f"✅ NO — no delisting problems in its SEC filings since {since}."
+    if not main and exchange.upper() == "OTC":
+        verdict += "\nℹ️ It currently trades OTC (not on a major exchange)."
+
+    blocks = []
+    for e in events[-12:]:
+        lines = [f"{e['date']} · {e['form']}", DELIST_KINDS[e["kind"]].format(cls=e.get("cls", ""))]
+        if e["reasons"]:
+            lines.append("Why: " + ", ".join(REASON_NAMES[r] for r in e["reasons"]))
+        if e["deadline"]:
+            lines.append(f"Deadline to fix: {e['deadline']}")
+        if e["title"]:
+            lines.append("📰 " + clip(e["title"]))
+        lines.append(f"🔗 {e['url']}")
+        blocks.append("\n".join(lines))
+
+    head = (f"🚨 Delisting check — {t} ({info['name']})\n"
+            f"Exchange: {exchange} · {len(filings)} filing(s) since {since} checked")
+    out = f"{head}\n\n{verdict}"
+    if blocks:
+        more = f" (last {len(blocks)} of {len(events)})" if len(events) > len(blocks) else ""
+        out += f"\n\nTimeline, oldest first{more}:\n\n" + "\n\n".join(blocks)
+    note = "Based on SEC filings only. A warning is NOT a delisting — companies usually get 180 days to fix it."
+    if skipped:
+        note += f"\n{skipped} older 8-K / 6-K filing(s) weren't read (limit {DELIST_MAX_READ})."
+    return out + "\n\n" + note
+
+
 # ---------- Telegram commands ----------
 def handle_commands(state):
     watch = state["watch"]
@@ -578,6 +838,14 @@ def run_command(watch, cmd, args):
             send(f"{t}: not found on SEC — check the ticker")
             return
         send(dilution_report(t, info, start, end))
+
+    elif cmd in ("/delisting", "/delist") and args:
+        t = args[0]
+        info = watch.get(t) or lookup(t)
+        if not info:
+            send(f"{t}: not found on SEC — check the ticker")
+            return
+        send(delisting_report(t, info))
 
     else:
         send(HELP)
