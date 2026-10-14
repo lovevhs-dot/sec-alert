@@ -772,9 +772,9 @@ def handle_commands(state):
         state["offset"] = u["update_id"] + 1
         msg = u.get("message") or {}
         chat = str(msg.get("chat", {}).get("id"))
-        print(f"  from chat {chat}: {msg.get('text')!r}")
+        # The repo (and its Actions logs) is public: never log chat ids or message text.
         if chat != CHAT_ID:
-            print(f"  ignored: chat {chat} does not match TG_CHAT_ID secret")
+            print("  ignored a message from another chat (doesn't match TG_CHAT_ID)")
             continue  # ignore anyone but you
         parts = (msg.get("text") or "").split()
         if not parts:
