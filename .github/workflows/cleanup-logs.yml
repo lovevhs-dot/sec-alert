@@ -1,0 +1,41 @@
+name: cleanup-logs
+
+# Run manually from the Actions tab. Deletes every finished run (and its logs) that started
+# before this cleanup, e.g. old logs that printed Telegram chat ids and messages.
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  delete:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Delete old runs and their logs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          before=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          deleted=0
+          while true; do
+            ids=$(gh api "repos/$REPO/actions/runs?per_page=100&status=completed&created=<$before" --jq '.workflow_runs[].id')
+            [ -z "$ids" ] && break
+            page=0
+            for id in $ids; do
+              while ! gh api -X DELETE "repos/$REPO/actions/runs/$id" --silent; do
+                left=$(gh api rate_limit --jq '.resources.core.remaining')
+                [ "$left" -gt 0 ] && continue 2  # not a rate limit (e.g. already gone) -> skip this run
+                reset=$(gh api rate_limit --jq '.resources.core.reset')
+                wait=$(( reset - $(date +%s) + 5 )); [ "$wait" -lt 30 ] && wait=30
+                echo "API limit reached, waiting ${wait}s"; sleep "$wait"
+              done
+              page=$((page + 1))
+            done
+            deleted=$((deleted + page))
+            echo "deleted $deleted run(s) so far"
+            [ "$page" -eq 0 ] && break  # nothing on this page could be deleted -> stop instead of looping
+          done
+          echo "done: deleted $deleted run(s) from before $before"
