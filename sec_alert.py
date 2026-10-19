@@ -1,6 +1,7 @@
 """SEC filing -> Telegram alert bot.
 
 Telegram commands:
+  /check NVDA        one-screen summary: delisting, halts, dilution, splits, late reports, dividends, insiders
   /add NVDA AAPL     add tickers (one or more)
   /remove NVDA       remove tickers
   /removeall        clear the whole watchlist
@@ -40,7 +41,7 @@ STATE_KEY = (os.environ.get("STATE_KEY") or "").strip()  # without it, state is 
 PLAIN_STATE = Path("state.json")
 SECRET_STATE = Path("state.enc")
 SKIP_FORMS = set()  # filing types you don't want alerts for. e.g. {"4", "144"}
-MENU_VERSION = 7  # bump when COMMANDS change so Telegram's menu gets refreshed
+MENU_VERSION = 8  # bump when COMMANDS change so Telegram's menu gets refreshed
 HALTS_URL = "https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts"
 # Halt types you don't want alerts for. Default: skip the short automatic volatility pauses (usually 5 minutes).
 # Remove codes from this set to get those too.
@@ -62,6 +63,7 @@ HALT_REASONS = {
 
 HELP = (
     "Commands:\n"
+    "/check TICKER — everything at a glance, one line each\n"
     "/add TICKER [TICKER...] — add to watchlist\n"
     "/remove TICKER [TICKER...] — remove from watchlist\n"
     "/removeall — clear the watchlist\n"
@@ -74,6 +76,7 @@ HELP = (
     "Marks: ⚠️ dilution risk · 💰 dividend · 🔀 reverse split · 🚨 delisting risk"
 )
 COMMANDS = [
+    {"command": "check", "description": "Everything at a glance: /check NVDA"},
     {"command": "add", "description": "Add tickers: /add NVDA AAPL"},
     {"command": "remove", "description": "Remove tickers: /remove NVDA"},
     {"command": "removeall", "description": "Clear the whole watchlist"},
@@ -154,11 +157,16 @@ def why(e):
 
 
 # ---------- HTTP ----------
+_sec_cache = {}  # url -> bytes for this run, so commands that share filings don't download them twice
+
+
 def sec_get(url):
-    time.sleep(0.2)  # SEC limit: 10 requests/second
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return r.read()
+    if url not in _sec_cache:
+        time.sleep(0.2)  # SEC limit: 10 requests/second
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            _sec_cache[url] = r.read()
+    return _sec_cache[url]
 
 
 def sec_json(url):
@@ -414,19 +422,19 @@ def money(val, unit, per_share=False):
     return f"{sym}{val:,.0f}"
 
 
-def dividend_report(t, info, years=6):
-    head = f"💰 Dividends — {t} ({info['name']})"
-    note = ("Annual reports only (10-K / 20-F); the current fiscal year isn't covered. "
-            "New dividend announcements show up as 💰 in filing alerts and /recent.")
+def dividend_summary(info, years=6):
+    """(one-line answer, full verdict, listing date, rows) from SEC financial data."""
     try:
         facts = sec_json(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{int(info['cik']):010d}.json").get("facts", {})
     except urllib.error.HTTPError as e:
         if e.code == 404:
-            return f"{head}\n\n❔ No financial data on SEC (common for funds/ETFs and some small issuers). Check /recent."
+            return ("❔ No financial data on SEC",
+                    "❔ No financial data on SEC (common for funds/ETFs and some small issuers). Check /recent.", "", [])
         raise
     latest = latest_fiscal_year_end(facts)
     if not latest:
-        return f"{head}\n\n❔ No annual report data on SEC yet, so this can't be checked. Check /recent."
+        return ("❔ No annual report data yet",
+                "❔ No annual report data on SEC yet, so this can't be checked. Check /recent.", "", [])
     try:
         listed, traded_before = listing_info(info["cik"])
     except Exception as e:
@@ -464,17 +472,31 @@ def dividend_report(t, info, years=6):
     public = [e for e, k in kinds.items() if k == "public"]
     unsure = [e for e, k in kinds.items() if k == "unsure"]
     if kinds.get(latest) == "public":
+        short = f"✅ Paid in its latest fiscal year (ending {latest})"
         verdict = f"✅ YES — public shareholders received a dividend in its latest fiscal year (ending {latest})."
     elif public:
+        short = f"⚠️ Paid before (last FY ending {max(public)}), not in the latest year"
         verdict = f"⚠️ YES before — public shareholders received dividends (last: FY ending {max(public)}), but none in its latest fiscal year (ending {latest})."
     elif unsure:
+        short = "❓ Unclear if public holders got it"
         verdict = "❓ UNCLEAR — SEC data can't tell if public holders got the payout(s) marked ❓. Check those filings."
     elif kinds:
+        short = "🔒 None to public holders (only before listing)"
         verdict = f"🔒 NO — no dividend has gone to public shareholders through its latest fiscal year (ending {latest}). Earlier payouts were before listing."
     else:
+        short = f"🚫 None in the last {years} fiscal years"
         verdict = (f"🚫 NO — no dividends found in the last {years} fiscal years (latest ends {latest}).\n"
                    "Some issuers don't tag dividend data, so check /recent to be 100% sure.")
+    return short, verdict, listed, rows
 
+
+def dividend_report(t, info, years=6):
+    head = f"💰 Dividends — {t} ({info['name']})"
+    note = ("Annual reports only (10-K / 20-F); the current fiscal year isn't covered. "
+            "New dividend announcements show up as 💰 in filing alerts and /recent.")
+    _, verdict, listed, rows = dividend_summary(info, years)
+    if not rows and verdict.startswith("❔"):
+        return f"{head}\n\n{verdict}"
     lines = [head]
     if listed:
         lines.append(f"Listed: {listed}")
@@ -694,13 +716,8 @@ def track_issues(events):
     return open_issues, fixed
 
 
-def delisting_report(t, info):
-    today = date.today()
-    since = (today - timedelta(days=DELIST_YEARS * 365)).isoformat()
-    filings = [f for f in recent_filings(info["cik"], 1000) if f["date"] >= since]
-    events, skipped = delisting_events(info["cik"], filings)
-    exchange = info.get("exchange") or "?"
-
+def delisting_verdict(events, exchange, since, today):
+    """(one-line answer, full verdict) from the listing events."""
     main = [e for e in events if e["kind"] in ("delist", "selfdelist")]
     stopped = [e for e in events if e["kind"] == "deregister"]
     open_issues, fixed = track_issues(events)
@@ -709,23 +726,31 @@ def delisting_report(t, info):
         effective = date.fromisoformat(e["date"]) + timedelta(days=10)  # Form 25 takes effect 10 days after filing
         who = "The exchange" if e["kind"] == "delist" else "The company itself"
         if effective > today:
+            short = f"🚨 Delisting scheduled — takes effect around {effective}"
             verdict = f"🚨 DELISTING SCHEDULED — {who} filed to remove the stock on {e['date']}. It takes effect around {effective}."
         else:
+            short = f"🚨 Delisted around {effective}"
             verdict = f"🚨 DELISTED — {who} filed to remove the stock on {e['date']}; removed around {effective}."
         verdict += "\n(This also happens after a buyout/merger, so check the latest news.)"
     elif stopped:
+        short = f"📴 Stopped SEC reporting (Form 15, {stopped[-1]['date']})"
         verdict = f"📴 STOPPED REPORTING — filed Form 15 on {stopped[-1]['date']}. Usually means it left the exchange or is going dark."
     elif open_issues:
         # An old warning with no delist decision a month after its deadline was most likely fixed without an announcement:
         # if it weren't, the exchange would have sent a delist decision, and that has to be filed.
         stale = {r for r, e in open_issues.items() if not e["decided"] and (
             (e["deadline"] and e["deadline"] < (today - timedelta(days=30)).isoformat()) or (today - date.fromisoformat(e["date"])).days > 365)}
+        names = ", ".join(REASON_NAMES.get(r, r) for r in open_issues)
         if any(e["decided"] for e in open_issues.values()):
+            short = f"🚨 Exchange decided to delist ({names}) — hearing/appeal"
             verdict = "🚨 AT RISK — the exchange has decided to delist; the company is appealing or running out of time."
         elif stale == set(open_issues):
+            short = f"❔ Probably fine — old warning ({names}), deadline passed with no delist decision"
             verdict = ("❔ PROBABLY FINE — got an exchange warning, but the deadline passed with no delist decision filed, "
                        "so it isn't being delisted. Companies often don't announce the fix.")
         else:
+            deadlines = sorted(e["deadline"] for e in open_issues.values() if e["deadline"])
+            short = f"⚠️ Warning not fixed yet ({names})" + (f" — deadline {deadlines[0]}" if deadlines else "")
             verdict = "⚠️ ONGOING — the exchange warned the company and no 'fixed' filing has come out yet."
         rows = []
         for r, e in open_issues.items():
@@ -743,11 +768,24 @@ def delisting_report(t, info):
         if fixed:
             verdict += f"\nEarlier problems were fixed (last fix: {fixed[-1]['date']})."
     elif fixed:
+        short = f"✅ Had a warning, fixed {fixed[-1]['date']}"
         verdict = f"✅ RESOLVED — had an exchange listing problem, but it was fixed (last fix: {fixed[-1]['date']})."
     else:
+        short = f"✅ No problems since {since}"
         verdict = f"✅ NO — no delisting problems in its SEC filings since {since}."
     if not main and exchange.upper() == "OTC":
+        short += " (trades OTC)"
         verdict += "\nℹ️ It currently trades OTC (not on a major exchange)."
+    return short, verdict
+
+
+def delisting_report(t, info):
+    today = date.today()
+    since = (today - timedelta(days=DELIST_YEARS * 365)).isoformat()
+    filings = [f for f in recent_filings(info["cik"], 1000) if f["date"] >= since]
+    events, skipped = delisting_events(info["cik"], filings)
+    exchange = info.get("exchange") or "?"
+    _, verdict = delisting_verdict(events, exchange, since, today)
 
     blocks = []
     for e in events[-12:]:
@@ -771,6 +809,105 @@ def delisting_report(t, info):
     if skipped:
         note += f"\n{skipped} older 8-K / 6-K filing(s) weren't read (limit {DELIST_MAX_READ})."
     return out + "\n\n" + note
+
+
+# ---------- One-screen summary ----------
+CHECK_MONTHS = 6        # window for dilution / reverse split
+INSIDER_DAYS = 90       # window for insider trades
+SHELF_YEARS = 3         # an S-3 / F-3 shelf can be used for 3 years
+LATE_FORMS = ("NT 10-K", "NT 10-Q", "NT 20-F", "NT 40-F")
+
+
+def check_report(t, info):
+    """One line per topic; the detailed commands are listed at the bottom."""
+    today = date.today()
+    cik = info["cik"]
+    filings = recent_filings(cik, 1000)
+    after = lambda days: [f for f in filings if f["date"] >= (today - timedelta(days=days)).isoformat()]
+    lines = []
+
+    def row(label, fn):
+        try:
+            lines.append(f"{label}: {fn()}")
+        except Exception as e:  # one topic failing shouldn't hide the rest
+            print(f"check {label} failed: {why(e)}")
+            lines.append(f"{label}: ❔ couldn't check right now")
+
+    def delisting():
+        since = (today - timedelta(days=DELIST_YEARS * 365)).isoformat()
+        events, _ = delisting_events(cik, [f for f in filings if f["date"] >= since])
+        return delisting_verdict(events, info.get("exchange") or "?", since, today)[0]
+
+    def halt():
+        mine = [h for h in fetch_halts() if h["symbol"] == t]
+        live = [h for h in mine if not h["resume_time"]]
+        if live:
+            return f"🚨 Halted now — {halt_reason(live[0]['code'])} (since {live[0]['date']} {live[0]['time']} ET)"
+        if mine:
+            return f"✅ Trading — was halted {mine[0]['date']} ({halt_reason(mine[0]['code'])})"
+        return "✅ Not halted"
+
+    recent = after(CHECK_MONTHS * 30)
+    blocks = []  # (filing, block) for the dilution / split window, oldest first; read once, used twice
+
+    def dilution():
+        blocks.extend((f, filing_block(cik, f)) for f in reversed(recent))
+        hits = [f for f, b in blocks if "Dilution risk" in b]
+        if not hits:
+            return f"✅ None in the last {CHECK_MONTHS} months"
+        return f"⚠️ {len(hits)} filing(s) in the last {CHECK_MONTHS} months — last: {hits[-1]['form']} · {hits[-1]['date']}"
+
+    def shelf():
+        shelves = [f for f in after(SHELF_YEARS * 365) if f["form"] in ("S-3", "F-3")]
+        if not shelves:
+            return "✅ None on file"
+        f = shelves[0]
+        until = date.fromisoformat(f["date"]) + timedelta(days=SHELF_YEARS * 365)
+        return f"⚠️ {f['form']} filed {f['date']} — can sell new shares anytime until ~{until}"
+
+    def split():
+        if recent and not blocks:
+            raise RuntimeError("dilution scan failed")  # same filings; don't claim "none" if they weren't read
+        hits = [f for f, b in blocks if "Reverse split" in b]
+        return f"🔀 Mentioned {hits[-1]['date']} ({hits[-1]['form']})" if hits else f"✅ None in the last {CHECK_MONTHS} months"
+
+    def late():
+        hits = [f for f in after(365) if f["form"] in LATE_FORMS]
+        return f"⚠️ {len(hits)} late notice(s) — last: {hits[0]['form']} · {hits[0]['date']}" if hits else "✅ On time (last 12 months)"
+
+    def insiders():
+        window = after(INSIDER_DAYS)
+        trades = sum(f["form"] in ("4", "4/A") for f in window)
+        plans = sum(f["form"] == "144" for f in window)
+        if not (trades or plans):
+            return f"None in the last {INSIDER_DAYS} days"
+        return f"{trades} trade report(s), {plans} planned sale(s) in the last {INSIDER_DAYS} days"
+
+    def holders():
+        hits = [f for f in after(365) if re.match(r"(SC|SCHEDULE) 13[DG]", f["form"])]
+        if not hits:
+            return "None in the last 12 months"
+        active = any("13D" in f["form"] for f in hits)
+        return f"{len(hits)} filing(s) in the last 12 months — last {hits[0]['date']}" + (" · includes 13D (may push for changes)" if active else "")
+
+    row("🚨 Delisting", delisting)
+    row("⛔ Halt", halt)
+    row("💸 Dilution", dilution)
+    row("🗄 Shelf (sell-anytime)", shelf)
+    row("🔀 Reverse split", split)
+    row("⏰ Late reports", late)
+    row("💰 Dividends", lambda: dividend_summary(info)[0])
+    row("👤 Insiders", insiders)
+    row("🐋 5%+ holders", holders)
+
+    head = f"🔎 {t} · {info.get('exchange') or '?'} — {info['name']}"
+    if filings:
+        f = filings[0]
+        label = form_label(f["form"])
+        head += f"\nLatest filing: {f['form']} · {f['date']}" + (f" ({label})" if label else "")
+    start = (today - timedelta(days=CHECK_MONTHS * 30)).strftime("%y%m%d")
+    details = f"Details: /delisting {t} · /dilution {t} {start} · /dividends {t} · /recent {t}"
+    return f"{head}\n\n" + "\n".join(lines) + f"\n\n{details}"
 
 
 # ---------- Telegram commands ----------
@@ -870,6 +1007,15 @@ def run_command(watch, cmd, args):
             send(f"{t}: not found on SEC — check the ticker")
             return
         send(dilution_report(t, info, start, end))
+
+    elif cmd == "/check" and args:
+        t = args[0]
+        info = watch.get(t) or lookup(t)
+        if not info:
+            send(f"{t}: not found on SEC — check the ticker")
+            return
+        send(f"🔎 Checking {t}… this can take up to a minute.")
+        send(check_report(t, info))
 
     elif cmd in ("/delisting", "/delist") and args:
         t = args[0]
