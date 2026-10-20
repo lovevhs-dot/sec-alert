@@ -10,8 +10,12 @@ Telegram commands:
   /dividends NVDA    dividend history from SEC financial data (per share + total paid)
   /dilution NVDA 260102 [260703]   dilution-related filings between two dates (YYMMDD; no end = today)
   /delisting NVDA    delisting status: warned / scheduled / delisted / fixed, from SEC filings
+  /market            Nasdaq today and upcoming holidays, early closes, clock changes (New York time)
+  /rules             latest Nasdaq listing-rule changes and SEC low-priced-stock notices
 
-Alerts: new SEC filings and trading halts (Nasdaq halt feed, all US exchanges) for your watchlist.
+Alerts: new SEC filings and trading halts (Nasdaq halt feed, all US exchanges) for your watchlist;
+market closures (evening before), early closes (that morning), clock changes (a week before and on the day);
+new listing-rule changes.
 Filings that mention a dividend are marked 💰.
 
 Run periodically by GitHub Actions: handle commands -> check filings -> check halts -> save state.
@@ -20,6 +24,7 @@ and logs never name tickers, filings or chats.
 No external packages (Python standard library only).
 """
 import base64
+import email.utils
 import hashlib
 import hmac
 import html
@@ -31,8 +36,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 TOKEN = os.environ["TG_TOKEN"].strip()
 CHAT_ID = os.environ["TG_CHAT_ID"].strip()
@@ -41,7 +47,7 @@ STATE_KEY = (os.environ.get("STATE_KEY") or "").strip()  # without it, state is 
 PLAIN_STATE = Path("state.json")
 SECRET_STATE = Path("state.enc")
 SKIP_FORMS = set()  # filing types you don't want alerts for. e.g. {"4", "144"}
-MENU_VERSION = 8  # bump when COMMANDS change so Telegram's menu gets refreshed
+MENU_VERSION = 9  # bump when COMMANDS change so Telegram's menu gets refreshed
 HALTS_URL = "https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts"
 # Halt types you don't want alerts for. Default: skip the short automatic volatility pauses (usually 5 minutes).
 # Remove codes from this set to get those too.
@@ -71,8 +77,11 @@ HELP = (
     "/recent TICKER [N] — latest N filings (default 5, max 20)\n"
     "/dividends TICKER — dividend history (per share + total paid)\n"
     "/dilution TICKER YYMMDD [YYMMDD] — dilution filings in a date range (no end = today)\n"
-    "/delisting TICKER — delisting status: warned, scheduled, delisted or fixed\n\n"
-    "You get alerts for new SEC filings and trading halts on your watchlist.\n\n"
+    "/delisting TICKER — delisting status: warned, scheduled, delisted or fixed\n"
+    "/market — Nasdaq today, next holidays and early closes (New York time)\n"
+    "/rules — latest Nasdaq listing-rule changes\n\n"
+    "You get alerts for new SEC filings and trading halts on your watchlist, market closures, early closes, "
+    "clock changes and listing-rule changes.\n\n"
     "Marks: ⚠️ dilution risk · 💰 dividend · 🔀 reverse split · 🚨 delisting risk"
 )
 COMMANDS = [
@@ -85,6 +94,8 @@ COMMANDS = [
     {"command": "dividends", "description": "Dividend history: /dividends AAPL"},
     {"command": "dilution", "description": "Dilution filings: /dilution NVDA 260102 260703"},
     {"command": "delisting", "description": "Delisting status: /delisting NVDA"},
+    {"command": "market", "description": "Nasdaq today, holidays, early closes"},
+    {"command": "rules", "description": "Latest listing-rule changes"},
 ]
 
 # ---------- Dilution / share-count warning ----------
@@ -910,6 +921,266 @@ def check_report(t, info):
     return f"{head}\n\n" + "\n".join(lines) + f"\n\n{details}"
 
 
+# ---------- US market calendar (all in New York time, the exchange's own clock) ----------
+NY = ZoneInfo("America/New_York")
+PRE_OPEN, OPEN, CLOSE, EARLY_CLOSE, AFTER_CLOSE = (4, 0), (9, 30), (16, 0), (13, 0), (20, 0)  # Nasdaq hours
+
+
+def easter(y):
+    """Easter Sunday (anonymous Gregorian algorithm); Good Friday is two days before."""
+    a, (b, c) = y % 19, divmod(y, 100)
+    d, e = divmod(b, 4)
+    g = (b - (b + 8) // 25 + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = divmod(c, 4)
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month, day = divmod(h + l - 7 * m + 114, 31)
+    return date(y, month, day + 1)
+
+
+def nth_weekday(y, month, weekday, n):
+    """n-th weekday (Mon=0) of a month; n=-1 for the last one."""
+    if n > 0:
+        first = date(y, month, 1)
+        return first + timedelta(days=(weekday - first.weekday()) % 7 + 7 * (n - 1))
+    last = date(y + (month == 12), month % 12 + 1, 1) - timedelta(days=1)
+    return last - timedelta(days=(last.weekday() - weekday) % 7)
+
+
+def observed(d):
+    """A holiday on Saturday is observed Friday, on Sunday the following Monday."""
+    return d - timedelta(days=1) if d.weekday() == 5 else d + timedelta(days=1) if d.weekday() == 6 else d
+
+
+def market_holidays(y):
+    """{date: name} of full-day closures, by the published NYSE/Nasdaq holiday rules."""
+    h = {}
+    new_year = date(y, 1, 1)
+    if new_year.weekday() != 5:  # a Saturday New Year's Day isn't moved to the previous Friday
+        h[observed(new_year)] = "New Year's Day"
+    h[nth_weekday(y, 1, 0, 3)] = "Martin Luther King Jr. Day"
+    h[nth_weekday(y, 2, 0, 3)] = "Presidents' Day"
+    h[easter(y) - timedelta(days=2)] = "Good Friday"
+    h[nth_weekday(y, 5, 0, -1)] = "Memorial Day"
+    if y >= 2022:
+        h[observed(date(y, 6, 19))] = "Juneteenth"
+    h[observed(date(y, 7, 4))] = "Independence Day"
+    h[nth_weekday(y, 9, 0, 1)] = "Labor Day"
+    h[nth_weekday(y, 11, 3, 4)] = "Thanksgiving Day"
+    h[observed(date(y, 12, 25))] = "Christmas Day"
+    return h
+
+
+def early_closes(y):
+    """{date: reason} of 13:00 closes: day before Independence Day, day after Thanksgiving, Christmas Eve."""
+    out = {nth_weekday(y, 11, 3, 4) + timedelta(days=1): "day after Thanksgiving"}
+    if date(y, 7, 4).weekday() in (1, 2, 3, 4):  # July 3 is a normal weekday only when July 4 is Tue-Fri
+        out[date(y, 7, 3)] = "day before Independence Day"
+    if date(y, 12, 24).weekday() < 4:  # Mon-Thu; a Friday Christmas Eve is the observed holiday itself
+        out[date(y, 12, 24)] = "Christmas Eve"
+    return out
+
+
+def is_trading_day(d):
+    return d.weekday() < 5 and d not in market_holidays(d.year)
+
+
+def dst_changes(y):
+    """[(date, 'starts' | 'ends')] when New York clocks change."""
+    out, prev = [], None
+    for i in range(366 if y % 4 == 0 else 365):
+        d = date(y, 1, 1) + timedelta(days=i)
+        off = datetime(d.year, d.month, d.day, 12, tzinfo=NY).utcoffset()
+        if prev is not None and off != prev:
+            out.append((d, "starts" if off > prev else "ends"))
+        prev = off
+    return out
+
+
+def upcoming(kind, today, n=1):
+    """Next n holidays / early closes / clock changes from today on, as (date, label)."""
+    items = []
+    for y in (today.year, today.year + 1):
+        source = {"holiday": market_holidays, "early": early_closes}.get(kind)
+        found = source(y).items() if source else dst_changes(y)
+        items += [(d, x) for d, x in found if d >= today]
+    return sorted(items)[:n]
+
+
+def hm(t):
+    return f"{t[0]:02d}:{t[1]:02d}"
+
+
+def market_status(now):
+    """Short status of Nasdaq right now (New York time)."""
+    today, t = now.date(), (now.hour, now.minute)
+    if today in market_holidays(today.year):
+        return f"closed — {market_holidays(today.year)[today]}"
+    if today.weekday() >= 5:
+        return "closed — weekend"
+    close = EARLY_CLOSE if today in early_closes(today.year) else CLOSE
+    if t < PRE_OPEN:
+        return "closed — pre-market opens 04:00"
+    if t < OPEN:
+        return "pre-market — regular session opens 09:30"
+    if t < close:
+        left = (close[0] * 60 + close[1]) - (t[0] * 60 + t[1])
+        return f"open — closes {hm(close)} (in {left // 60}h {left % 60:02d}m)"
+    if t < AFTER_CLOSE:
+        return "after-hours — until 20:00"
+    return "closed"
+
+
+def market_report():
+    now = datetime.now(NY)
+    today = now.date()
+    close = EARLY_CLOSE if today in early_closes(today.year) else CLOSE
+    lines = [f"🗓 {today:%a %m/%d} · New York — Nasdaq {market_status(now)}"]
+    if is_trading_day(today):
+        lines.append(f"Hours today: {hm(OPEN)} – {hm(close)} New York time"
+                     + (" (early close)" if close == EARLY_CLOSE else ""))
+    lines.append("")
+    for d, name in upcoming("holiday", today + timedelta(days=1), 3):
+        lines.append(f"🏖 Closed {d:%a %m/%d} — {name}")
+    for d, why_ in upcoming("early", today + timedelta(days=1), 2):
+        lines.append(f"⏰ Early close {d:%a %m/%d} — 13:00 ({why_})")
+    for d, kind in upcoming("dst", today, 1):
+        lines.append(f"🕐 Daylight saving time {kind} {d:%a %m/%d} — New York clocks go "
+                     f"{'forward' if kind == 'starts' else 'back'} 1 hour")
+    lines += ["", "All times New York time (the exchange's clock). Regular hours 09:30 – 16:00, "
+                  "pre-market from 04:00, after-hours until 20:00."]
+    return "\n".join(lines)
+
+
+def calendar_alerts(state):
+    """Holiday the evening before, early close the same morning, clock change a week before and on the day."""
+    now = datetime.now(NY)
+    today = now.date()
+    sent = state.setdefault("calendar_sent", [])
+    due = []
+    for d, name in upcoming("holiday", today, 2):
+        last = d - timedelta(days=1)
+        while not is_trading_day(last):
+            last -= timedelta(days=1)
+        if (today > last or (today == last and (now.hour, now.minute) >= CLOSE)) and today <= d:
+            when = "tomorrow" if d == today + timedelta(days=1) else "today" if d == today else f"on {d:%A}"
+            due.append((f"holiday {d}", f"🏖 Nasdaq is closed {when} ({d:%a %m/%d}) — {name}"))
+    for d, why_ in upcoming("early", today, 1):
+        if d == today and (6, 0) <= (now.hour, now.minute) < EARLY_CLOSE:
+            due.append((f"early {d}", f"⏰ Early close today — Nasdaq closes at 13:00 New York time ({why_})"))
+    for d, kind in upcoming("dst", today, 1):
+        move = "forward" if kind == "starts" else "back"
+        if d - timedelta(days=7) <= today < d and now.hour >= 9:
+            due.append((f"dst-week {d}", f"🕐 In {(d - today).days} days ({d:%a %m/%d}) daylight saving time {kind} in "
+                        f"New York — clocks go {move} 1 hour. Nasdaq stays 09:30 – 16:00 New York time; "
+                        "from other time zones it opens 1 hour " + ("earlier." if kind == "starts" else "later.")))
+        if d == today and now.hour >= 6:
+            due.append((f"dst-day {d}", f"🕐 Today daylight saving time {kind} in New York — clocks went {move} "
+                        "1 hour. Nasdaq stays 09:30 – 16:00 New York time."))
+    for key, text in due:
+        if key not in sent:
+            send(text)
+            sent.append(key)
+    del sent[:-30]  # keep the list short
+
+
+# ---------- Listing-rule changes (Nasdaq filings with the SEC, SEC press releases) ----------
+# Every Nasdaq rule change is filed with the SEC and published in the Federal Register (the official US journal).
+FED_REG_URL = "https://www.federalregister.gov/api/v1/documents.json"
+SEC_PRESS_URL = "https://www.sec.gov/news/pressreleases.rss"
+RULE_TOPICS = [  # (pattern, plain-English topic); only items matching one of these are reported
+    (r"bid price|5550\(a\)\(2\)|5450\(a\)\(1\)|5810\(c\)\(3\)\(A\)", "share price under $1 rules"),
+    (r"reverse (stock )?split", "reverse split rules"),
+    (r"delist|5810|5815|5820|hearings? panel", "delisting process"),
+    (r"(initial|continued) listing|listing (standard|requirement)s?|(listing )?rules? 5[0-689][0-9]{2}", "listing requirements"),
+    (r"penny stock|low[- ]priced|micro-?cap", "penny stock / low-priced stocks"),
+]
+# Nasdaq files many applications to list single funds / ETFs / options; those aren't about company listing rules
+NOT_COMPANY_RULES = re.compile(r"(?i)\b(etf|exchange-traded|fund|trust|shares of|options?|index-linked|commodity|"
+                               r"managed portfolio|57\d\d|fee schedule|fees)\b")
+# SEC press releases count only when they're about rules or guidance (not enforcement cases like "SEC Charges ...")
+SEC_RULE_WORDS = re.compile(r"(?i)\b(rule|propos|adopt|amend|standard|requirement|alert|bulletin|guidance|statement)")
+FR_PREFIX = re.compile(r"(?i)^self-regulatory organizations; the nasdaq stock market llc;\s*")
+RULES_RECENT = 10  # how many matching items /rules remembers
+
+
+def rule_topic(item):
+    """Plain-English topic of a company-listing-rule item, '' if it isn't one."""
+    title = item["title"]
+    if NOT_COMPANY_RULES.search(title) or (item["id"].startswith("sec:") and not SEC_RULE_WORDS.search(title)):
+        return ""
+    return next((name for pat, name in RULE_TOPICS if re.search(pat, title, re.I)), "")
+
+
+def http_get(url):
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return r.read()
+
+
+def fetch_rule_items():
+    """[{id, date, title, url, source}] newest first, from the Federal Register (Nasdaq) and SEC press releases."""
+    items = []
+    query = urllib.parse.urlencode([
+        ("per_page", 50), ("order", "newest"), ("conditions[agencies][]", "securities-and-exchange-commission"),
+        ("conditions[term]", '"Nasdaq Stock Market"'),
+        ("fields[]", "document_number"), ("fields[]", "title"), ("fields[]", "publication_date"), ("fields[]", "html_url")])
+    for r in json.loads(http_get(f"{FED_REG_URL}?{query}")).get("results", []):
+        if "nasdaq stock market" in r.get("title", "").lower():  # the main Nasdaq exchange, not Nasdaq PHLX / BX
+            items.append({"id": "fr:" + r["document_number"], "date": r["publication_date"],
+                          "title": FR_PREFIX.sub("", r["title"]),
+                          "url": r["html_url"], "source": "Nasdaq rule filing (Federal Register)"})
+    try:
+        rss = http_get(SEC_PRESS_URL).decode("utf-8", "replace")
+        for it in re.findall(r"(?s)<item>(.*?)</item>", rss):
+            tag = lambda n: html.unescape((re.search(rf"(?s)<{n}>(.*?)</{n}>", it) or [None, ""])[1]).strip()
+            try:
+                when = email.utils.parsedate_to_datetime(tag("pubDate")).date().isoformat()
+            except (TypeError, ValueError):
+                when = ""
+            items.append({"id": "sec:" + tag("link"), "date": when, "title": tag("title"),
+                          "url": tag("link"), "source": "SEC press release"})
+    except Exception as e:  # one source down shouldn't stop the other
+        print(f"sec press feed failed: {why(e)}")
+    return items
+
+
+def check_rules(state):
+    """Hourly: message about new listing-rule items. The first run only records what's there (no flood)."""
+    r = state.setdefault("rules", {})
+    hour = datetime.now(NY).strftime("%Y-%m-%dT%H")
+    if r.get("checked") == hour:
+        return
+    try:
+        items = fetch_rule_items()
+    except Exception as e:  # try again next hour
+        print(f"rule check failed: {why(e)}")
+        return
+    r["checked"] = hour
+    seen = set(r.get("seen", []))
+    relevant = [dict(i, topic=rule_topic(i)) for i in items if rule_topic(i)]
+    new = [i for i in relevant if i["id"] not in seen]
+    print(f"rules: {len(items)} items · {len(relevant)} about listing rules · {len(new)} new")  # public data only
+    if "since" in r:  # not the first run
+        for i in reversed(new):
+            send(f"📜 {i['topic'].capitalize()} — {i['source']}\n{clip(i['title'], 300)}\n{i['date']}\n🔗 {i['url']}")
+    else:
+        r["since"] = datetime.now(NY).date().isoformat()
+    r["seen"] = (r.get("seen", []) + [i["id"] for i in items if i["id"] not in seen])[-500:]
+    r["recent"] = (new + r.get("recent", []))[:RULES_RECENT] if "recent" in r else relevant[:RULES_RECENT]
+
+
+def rules_report(state):
+    r = state.get("rules", {})
+    recent = r.get("recent", [])[:5]
+    if not recent:
+        return ("📜 No listing-rule changes found yet. Watching Nasdaq rule filings (Federal Register) and "
+                "SEC press releases; you'll get a message when one appears.")
+    rows = [f"• {i['date']} · {i['topic']}\n  {clip(i['title'], 160)}\n  🔗 {i['url']}" for i in recent]
+    return f"📜 Latest listing-rule items (watching since {r.get('since', '?')})\n\n" + "\n\n".join(rows)
+
+
 # ---------- Telegram commands ----------
 def handle_commands(state):
     watch = state["watch"]
@@ -932,12 +1203,12 @@ def handle_commands(state):
         cmd = parts[0].lower().split("@")[0]
         args = [a.upper() for a in parts[1:]]
         try:
-            run_command(watch, cmd, args)
+            run_command(watch, cmd, args, state)
         except Exception as e:
             send(f"⚠️ Error while running {cmd}: {e}")
 
 
-def run_command(watch, cmd, args):
+def run_command(watch, cmd, args, state=None):
     if cmd == "/add" and args:
         lines = []
         for t in args:
@@ -1007,6 +1278,12 @@ def run_command(watch, cmd, args):
             send(f"{t}: not found on SEC — check the ticker")
             return
         send(dilution_report(t, info, start, end))
+
+    elif cmd == "/market":
+        send(market_report())
+
+    elif cmd == "/rules":
+        send(rules_report(state or {}))
 
     elif cmd == "/check" and args:
         t = args[0]
@@ -1161,6 +1438,11 @@ def main():
     handle_commands(state)
     check_filings(state)
     check_halts(state)
+    for step in (calendar_alerts, check_rules):  # one failing shouldn't stop the other or the state save
+        try:
+            step(state)
+        except Exception as e:
+            print(f"{step.__name__} failed: {why(e)}")
     # guarantees a commit at least monthly, so GitHub doesn't disable the schedule after 60 idle days
     state["heartbeat"] = time.strftime("%Y-%m")
     save_state(state)
