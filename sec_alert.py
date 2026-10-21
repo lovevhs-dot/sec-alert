@@ -11,11 +11,9 @@ Telegram commands:
   /dilution NVDA 260102 [260703]   dilution-related filings between two dates (YYMMDD; no end = today)
   /delisting NVDA    delisting status: warned / scheduled / delisted / fixed, from SEC filings
   /market            Nasdaq today and upcoming holidays, early closes, clock changes (New York time)
-  /rules             latest Nasdaq listing-rule changes and SEC low-priced-stock notices
 
 Alerts: new SEC filings and trading halts (Nasdaq halt feed, all US exchanges) for your watchlist;
-market closures (evening before), early closes (that morning), clock changes (a week before and on the day);
-new listing-rule changes.
+market closures (evening before), early closes (that morning), clock changes (a week before and on the day).
 Filings that mention a dividend are marked 💰.
 
 Run periodically by GitHub Actions: handle commands -> check filings -> check halts -> save state.
@@ -24,7 +22,6 @@ and logs never name tickers, filings or chats.
 No external packages (Python standard library only).
 """
 import base64
-import email.utils
 import hashlib
 import hmac
 import html
@@ -47,7 +44,7 @@ STATE_KEY = (os.environ.get("STATE_KEY") or "").strip()  # without it, state is 
 PLAIN_STATE = Path("state.json")
 SECRET_STATE = Path("state.enc")
 SKIP_FORMS = set()  # filing types you don't want alerts for. e.g. {"4", "144"}
-MENU_VERSION = 9  # bump when COMMANDS change so Telegram's menu gets refreshed
+MENU_VERSION = 10  # bump when COMMANDS change so Telegram's menu gets refreshed
 HALTS_URL = "https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts"
 # Halt types you don't want alerts for. Default: skip the short automatic volatility pauses (usually 5 minutes).
 # Remove codes from this set to get those too.
@@ -78,10 +75,9 @@ HELP = (
     "/dividends TICKER — dividend history (per share + total paid)\n"
     "/dilution TICKER YYMMDD [YYMMDD] — dilution filings in a date range (no end = today)\n"
     "/delisting TICKER — delisting status: warned, scheduled, delisted or fixed\n"
-    "/market — Nasdaq today, next holidays and early closes (New York time)\n"
-    "/rules — latest Nasdaq listing-rule changes\n\n"
+    "/market — Nasdaq today, next holidays and early closes (New York time)\n\n"
     "You get alerts for new SEC filings and trading halts on your watchlist, market closures, early closes, "
-    "clock changes and listing-rule changes.\n\n"
+    "and clock changes.\n\n"
     "Marks: ⚠️ dilution risk · 💰 dividend · 🔀 reverse split · 🚨 delisting risk"
 )
 COMMANDS = [
@@ -95,7 +91,6 @@ COMMANDS = [
     {"command": "dilution", "description": "Dilution filings: /dilution NVDA 260102 260703"},
     {"command": "delisting", "description": "Delisting status: /delisting NVDA"},
     {"command": "market", "description": "Nasdaq today, holidays, early closes"},
-    {"command": "rules", "description": "Latest listing-rule changes"},
 ]
 
 # ---------- Dilution / share-count warning ----------
@@ -1085,102 +1080,6 @@ def calendar_alerts(state):
     del sent[:-30]  # keep the list short
 
 
-# ---------- Listing-rule changes (Nasdaq filings with the SEC, SEC press releases) ----------
-# Every Nasdaq rule change is filed with the SEC and published in the Federal Register (the official US journal).
-FED_REG_URL = "https://www.federalregister.gov/api/v1/documents.json"
-SEC_PRESS_URL = "https://www.sec.gov/news/pressreleases.rss"
-RULE_TOPICS = [  # (pattern, plain-English topic); only items matching one of these are reported
-    (r"bid price|5550\(a\)\(2\)|5450\(a\)\(1\)|5810\(c\)\(3\)\(A\)", "share price under $1 rules"),
-    (r"reverse (stock )?split", "reverse split rules"),
-    (r"delist|5810|5815|5820|hearings? panel", "delisting process"),
-    (r"(initial|continued) listing|listing (standard|requirement)s?|(listing )?rules? 5[0-689][0-9]{2}", "listing requirements"),
-    (r"penny stock|low[- ]priced|micro-?cap", "penny stock / low-priced stocks"),
-]
-# Nasdaq files many applications to list single funds / ETFs / options; those aren't about company listing rules
-NOT_COMPANY_RULES = re.compile(r"(?i)\b(etf|exchange-traded|fund|trust|shares of|options?|index-linked|commodity|"
-                               r"managed portfolio|57\d\d|fee schedule|fees)\b")
-# SEC press releases count only when they're about rules or guidance (not enforcement cases like "SEC Charges ...")
-SEC_RULE_WORDS = re.compile(r"(?i)\b(rule|propos|adopt|amend|standard|requirement|alert|bulletin|guidance|statement)")
-FR_PREFIX = re.compile(r"(?i)^self-regulatory organizations; the nasdaq stock market llc;\s*")
-RULES_RECENT = 10  # how many matching items /rules remembers
-
-
-def rule_topic(item):
-    """Plain-English topic of a company-listing-rule item, '' if it isn't one."""
-    title = item["title"]
-    if NOT_COMPANY_RULES.search(title) or (item["id"].startswith("sec:") and not SEC_RULE_WORDS.search(title)):
-        return ""
-    return next((name for pat, name in RULE_TOPICS if re.search(pat, title, re.I)), "")
-
-
-def http_get(url):
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return r.read()
-
-
-def fetch_rule_items():
-    """[{id, date, title, url, source}] newest first, from the Federal Register (Nasdaq) and SEC press releases."""
-    items = []
-    query = urllib.parse.urlencode([
-        ("per_page", 50), ("order", "newest"), ("conditions[agencies][]", "securities-and-exchange-commission"),
-        ("conditions[term]", '"Nasdaq Stock Market"'),
-        ("fields[]", "document_number"), ("fields[]", "title"), ("fields[]", "publication_date"), ("fields[]", "html_url")])
-    for r in json.loads(http_get(f"{FED_REG_URL}?{query}")).get("results", []):
-        if "nasdaq stock market" in r.get("title", "").lower():  # the main Nasdaq exchange, not Nasdaq PHLX / BX
-            items.append({"id": "fr:" + r["document_number"], "date": r["publication_date"],
-                          "title": FR_PREFIX.sub("", r["title"]),
-                          "url": r["html_url"], "source": "Nasdaq rule filing (Federal Register)"})
-    try:
-        rss = http_get(SEC_PRESS_URL).decode("utf-8", "replace")
-        for it in re.findall(r"(?s)<item>(.*?)</item>", rss):
-            tag = lambda n: html.unescape((re.search(rf"(?s)<{n}>(.*?)</{n}>", it) or [None, ""])[1]).strip()
-            try:
-                when = email.utils.parsedate_to_datetime(tag("pubDate")).date().isoformat()
-            except (TypeError, ValueError):
-                when = ""
-            items.append({"id": "sec:" + tag("link"), "date": when, "title": tag("title"),
-                          "url": tag("link"), "source": "SEC press release"})
-    except Exception as e:  # one source down shouldn't stop the other
-        print(f"sec press feed failed: {why(e)}")
-    return items
-
-
-def check_rules(state):
-    """Hourly: message about new listing-rule items. The first run only records what's there (no flood)."""
-    r = state.setdefault("rules", {})
-    hour = datetime.now(NY).strftime("%Y-%m-%dT%H")
-    if r.get("checked") == hour:
-        return
-    try:
-        items = fetch_rule_items()
-    except Exception as e:  # try again next hour
-        print(f"rule check failed: {why(e)}")
-        return
-    r["checked"] = hour
-    seen = set(r.get("seen", []))
-    relevant = [dict(i, topic=rule_topic(i)) for i in items if rule_topic(i)]
-    new = [i for i in relevant if i["id"] not in seen]
-    print(f"rules: {len(items)} items · {len(relevant)} about listing rules · {len(new)} new")  # public data only
-    if "since" in r:  # not the first run
-        for i in reversed(new):
-            send(f"📜 {i['topic'].capitalize()} — {i['source']}\n{clip(i['title'], 300)}\n{i['date']}\n🔗 {i['url']}")
-    else:
-        r["since"] = datetime.now(NY).date().isoformat()
-    r["seen"] = (r.get("seen", []) + [i["id"] for i in items if i["id"] not in seen])[-500:]
-    r["recent"] = (new + r.get("recent", []))[:RULES_RECENT] if "recent" in r else relevant[:RULES_RECENT]
-
-
-def rules_report(state):
-    r = state.get("rules", {})
-    recent = r.get("recent", [])[:5]
-    if not recent:
-        return ("📜 No listing-rule changes found yet. Watching Nasdaq rule filings (Federal Register) and "
-                "SEC press releases; you'll get a message when one appears.")
-    rows = [f"• {i['date']} · {i['topic']}\n  {clip(i['title'], 160)}\n  🔗 {i['url']}" for i in recent]
-    return f"📜 Latest listing-rule items (watching since {r.get('since', '?')})\n\n" + "\n\n".join(rows)
-
-
 # ---------- Telegram commands ----------
 def handle_commands(state):
     watch = state["watch"]
@@ -1203,12 +1102,12 @@ def handle_commands(state):
         cmd = parts[0].lower().split("@")[0]
         args = [a.upper() for a in parts[1:]]
         try:
-            run_command(watch, cmd, args, state)
+            run_command(watch, cmd, args)
         except Exception as e:
             send(f"⚠️ Error while running {cmd}: {e}")
 
 
-def run_command(watch, cmd, args, state=None):
+def run_command(watch, cmd, args):
     if cmd == "/add" and args:
         lines = []
         for t in args:
@@ -1281,9 +1180,6 @@ def run_command(watch, cmd, args, state=None):
 
     elif cmd == "/market":
         send(market_report())
-
-    elif cmd == "/rules":
-        send(rules_report(state or {}))
 
     elif cmd == "/check" and args:
         t = args[0]
@@ -1438,11 +1334,11 @@ def main():
     handle_commands(state)
     check_filings(state)
     check_halts(state)
-    for step in (calendar_alerts, check_rules):  # one failing shouldn't stop the other or the state save
-        try:
-            step(state)
-        except Exception as e:
-            print(f"{step.__name__} failed: {why(e)}")
+    try:
+        calendar_alerts(state)
+    except Exception as e:  # a calendar problem shouldn't stop the state save
+        print(f"calendar alerts failed: {why(e)}")
+    state.pop("rules", None)  # leftover from the removed listing-rule watch
     # guarantees a commit at least monthly, so GitHub doesn't disable the schedule after 60 idle days
     state["heartbeat"] = time.strftime("%Y-%m")
     save_state(state)
