@@ -1,0 +1,768 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Hiragana Studio</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Noto+Sans+JP:wght@400;500;700&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #fdfcfc;
+      --surface: #ffffff;
+      --surface-dim: #f2f0f0;
+      --surface-high: #e6e6e6;
+      --text: #111111;
+      --text-muted: rgba(0, 0, 0, 0.55);
+      --stroke: #e3e3e3;
+      --outline: #727676;
+      --primary: #3186ff;
+      --accent-container: #dcf1ff;
+      --positive: #008052;
+      --positive-container: #daf9d4;
+      --error: #de2d29;
+      --error-container: #ffdeec;
+      --r-s: 8px;
+      --r-m: 12px;
+      --r-full: 999px;
+      --ff-sans: 'Inter', 'Noto Sans JP', system-ui, sans-serif;
+      --ff-jp: 'Noto Sans JP', 'Hiragino Sans', 'Yu Gothic', sans-serif;
+      --ff-mono: 'JetBrains Mono', ui-monospace, monospace;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0f0f0f;
+        --surface: #1c1c1c;
+        --surface-dim: #141414;
+        --surface-high: #2a2a2a;
+        --text: #e0e0e0;
+        --text-muted: rgba(255, 255, 255, 0.55);
+        --stroke: #2d2f38;
+        --outline: #9a9b9c;
+        --primary: #9dd2ff;
+        --accent-container: #192967;
+        --positive: #0ebc5f;
+        --positive-container: #002220;
+        --error: #ff4c45;
+        --error-container: #3c0202;
+      }
+    }
+
+    *, *::before, *::after { box-sizing: border-box; }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--ff-sans);
+      -webkit-font-smoothing: antialiased;
+    }
+
+    button {
+      font-family: inherit;
+      color: inherit;
+      cursor: pointer;
+    }
+
+    .app {
+      max-width: 760px;
+      margin: 0 auto;
+      padding: 24px 16px 40px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .header-bar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .header-bar h1 {
+      margin: 0;
+      font-size: 24px;
+      font-weight: 600;
+    }
+
+    .header-bar p {
+      margin: 2px 0 0;
+      font-size: 13px;
+      color: var(--text-muted);
+    }
+
+    .segmented {
+      display: flex;
+      background: var(--surface-dim);
+      padding: 4px;
+      border-radius: var(--r-full);
+      gap: 4px;
+    }
+
+    .segmented button {
+      border: none;
+      background: transparent;
+      padding: 8px 16px;
+      border-radius: var(--r-full);
+      font-size: 14px;
+      font-weight: 500;
+      color: var(--text-muted);
+      transition: background 0.15s, color 0.15s;
+    }
+
+    .segmented button.is-active {
+      background: var(--surface);
+      color: var(--text);
+      box-shadow: 0 0 12px rgba(0, 0, 0, 0.08);
+    }
+
+    .controls-deck {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      background: var(--surface-dim);
+      padding: 12px;
+      border-radius: var(--r-m);
+    }
+
+    .chip-group {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+    }
+
+    .chip {
+      border: 1px solid var(--stroke);
+      background: var(--surface);
+      padding: 6px 12px;
+      border-radius: var(--r-full);
+      font-size: 13px;
+      font-weight: 500;
+      transition: background 0.15s, border-color 0.15s;
+    }
+
+    .chip:hover { background: var(--surface-high); }
+
+    .chip.is-active {
+      background: var(--accent-container);
+      color: var(--primary);
+      border-color: transparent;
+    }
+
+    .switch {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      color: var(--text-muted);
+      cursor: pointer;
+      user-select: none;
+    }
+
+    .switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+
+    .switch-track {
+      position: relative;
+      width: 44px;
+      height: 26px;
+      background: var(--surface-high);
+      border-radius: var(--r-full);
+      transition: background 0.2s;
+    }
+
+    .switch-track::after {
+      content: "";
+      position: absolute;
+      top: 3px;
+      left: 3px;
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      background: #ffffff;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+      transition: left 0.2s;
+    }
+
+    .switch input:checked + .switch-track { background: var(--primary); }
+    .switch input:checked + .switch-track::after { left: 21px; }
+    .switch input:focus-visible + .switch-track { outline: 2px solid var(--text); outline-offset: 2px; }
+
+    /* Explore */
+    .grid-container {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(56px, 1fr));
+      gap: 6px;
+    }
+
+    .kana-cell {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 6px 2px;
+      min-height: 56px;
+      background: var(--surface);
+      border: 1px solid var(--stroke);
+      border-radius: var(--r-s);
+      transition: background 0.15s, border-color 0.15s;
+    }
+
+    .kana-cell:hover {
+      background: var(--surface-high);
+      border-color: var(--outline);
+    }
+
+    .kana-cell.is-selected {
+      background: var(--accent-container);
+      border-color: var(--primary);
+    }
+
+    .kana-glyph {
+      font-family: var(--ff-jp);
+      font-size: 22px;
+      line-height: 26px;
+      font-weight: 500;
+    }
+
+    .kana-romaji {
+      font-family: var(--ff-mono);
+      font-size: 12px;
+      color: var(--text-muted);
+      margin-top: 2px;
+    }
+
+    .inspector-card {
+      margin-top: 12px;
+      background: var(--surface);
+      border: 1px solid var(--stroke);
+      border-radius: var(--r-m);
+      padding: 12px;
+      display: grid;
+      grid-template-columns: 96px 1fr;
+      gap: 12px;
+      align-items: center;
+    }
+
+    @media (max-width: 480px) {
+      .inspector-card {
+        grid-template-columns: 1fr;
+        text-align: center;
+      }
+      .inspector-meta { justify-content: center; }
+    }
+
+    .inspector-glyph-box {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      background: var(--accent-container);
+      border-radius: var(--r-s);
+      padding: 12px 8px;
+    }
+
+    .inspector-glyph {
+      font-family: var(--ff-jp);
+      font-size: 44px;
+      line-height: 52px;
+      font-weight: 700;
+    }
+
+    .inspector-romaji {
+      font-family: var(--ff-mono);
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--primary);
+    }
+
+    .inspector-details {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .mnemonic-box {
+      background: var(--surface-dim);
+      padding: 8px 10px;
+      border-radius: var(--r-s);
+      font-size: 14px;
+      line-height: 20px;
+    }
+
+    .label {
+      display: block;
+      margin-bottom: 2px;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+      color: var(--text-muted);
+    }
+
+    .inspector-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .tag {
+      background: var(--surface-dim);
+      padding: 4px 10px;
+      border-radius: var(--r-full);
+      font-size: 13px;
+    }
+
+    .tag strong { font-family: var(--ff-jp); }
+
+    .tag.warning {
+      background: var(--error-container);
+      color: var(--error);
+      font-weight: 500;
+    }
+
+    /* Quiz */
+    .quiz-view {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .quiz-stats-bar {
+      display: flex;
+      justify-content: space-between;
+      background: var(--surface-dim);
+      padding: 8px 14px;
+      border-radius: var(--r-m);
+      font-size: 14px;
+    }
+
+    .quiz-card {
+      background: var(--surface);
+      border: 1px solid var(--stroke);
+      border-radius: var(--r-m);
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 12px;
+      text-align: center;
+    }
+
+    .quiz-prompt {
+      font-size: 13px;
+      color: var(--text-muted);
+    }
+
+    .quiz-prompt-glyph {
+      font-family: var(--ff-jp);
+      font-size: 72px;
+      line-height: 84px;
+      font-weight: 700;
+    }
+
+    .quiz-options-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      width: 100%;
+      max-width: 400px;
+    }
+
+    .quiz-option-btn {
+      padding: 12px 14px;
+      font-family: var(--ff-mono);
+      font-size: 16px;
+      font-weight: 600;
+      border-radius: var(--r-s);
+      border: 1px solid var(--stroke);
+      background: var(--surface-dim);
+      transition: background 0.15s, border-color 0.15s;
+    }
+
+    .quiz-option-btn:hover:not(:disabled) {
+      background: var(--surface-high);
+      border-color: var(--outline);
+    }
+
+    .quiz-option-btn:disabled { cursor: default; }
+
+    .quiz-option-btn.is-correct {
+      background: var(--positive-container);
+      color: var(--positive);
+      border-color: var(--positive);
+    }
+
+    .quiz-option-btn.is-incorrect {
+      background: var(--error-container);
+      color: var(--error);
+      border-color: var(--error);
+    }
+
+    .quiz-feedback-box {
+      width: 100%;
+      max-width: 400px;
+      padding: 10px 12px;
+      border-radius: var(--r-s);
+      background: var(--surface-dim);
+      font-size: 14px;
+      line-height: 20px;
+      text-align: left;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .feedback-title { font-weight: 600; }
+    .feedback-title.ok { color: var(--positive); }
+    .feedback-title.bad { color: var(--error); }
+    .feedback-tip { font-size: 13px; color: var(--text-muted); }
+
+    .next-btn {
+      align-self: flex-end;
+      margin-top: 4px;
+      border: none;
+      background: var(--primary);
+      color: var(--bg);
+      padding: 8px 16px;
+      border-radius: var(--r-full);
+      font-size: 14px;
+      font-weight: 600;
+    }
+
+    :focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <div class="header-bar">
+      <div>
+        <h1>Hiragana Studio</h1>
+        <p>Learn the shapes, then test yourself.</p>
+      </div>
+      <div class="segmented" id="mode-segmented">
+        <button type="button" class="is-active" data-mode="explore">Chart</button>
+        <button type="button" data-mode="quiz">Quiz</button>
+      </div>
+    </div>
+
+    <div class="controls-deck">
+      <div class="chip-group" id="category-chips">
+        <button type="button" class="chip is-active" data-cat="basic_1">Vowels, K, S</button>
+        <button type="button" class="chip" data-cat="basic_2">T, N, H</button>
+        <button type="button" class="chip" data-cat="basic_3">M, Y, R, W, N</button>
+        <button type="button" class="chip" data-cat="dakuten">Dakuten &amp; Combos</button>
+        <button type="button" class="chip" data-cat="all">All</button>
+      </div>
+      <label class="switch">
+        Romaji
+        <input type="checkbox" id="romaji-switch" checked>
+        <span class="switch-track"></span>
+      </label>
+    </div>
+
+    <div id="view-zone"></div>
+  </main>
+
+  <script>
+    const HIRAGANA_DATA = [
+      // Vowels & K / S
+      { kana: 'あ', romaji: 'a', cat: 'basic_1', mnemonic: 'An apple on a cross.', lookalike: null, example: { word: 'あめ', romaji: 'ame', meaning: 'Rain / Candy' } },
+      { kana: 'い', romaji: 'i', cat: 'basic_1', mnemonic: 'Two eel fishes swimming parallel.', lookalike: 'り (ri)', example: { word: 'いぬ', romaji: 'inu', meaning: 'Dog' } },
+      { kana: 'う', romaji: 'u', cat: 'basic_1', mnemonic: 'A person bent over kicking a ball U!', lookalike: 'つ (tsu)', example: { word: 'うみ', romaji: 'umi', meaning: 'Sea / Ocean' } },
+      { kana: 'え', romaji: 'e', cat: 'basic_1', mnemonic: 'An energetic ninja doing an acrobatic stretch.', lookalike: 'ん (n)', example: { word: 'えき', romaji: 'eki', meaning: 'Train Station' } },
+      { kana: 'お', romaji: 'o', cat: 'basic_1', mnemonic: 'A golfer making a hole-in-one shot!', lookalike: 'あ (a)', example: { word: 'おねがい', romaji: 'onegai', meaning: 'Please' } },
+
+      { kana: 'か', romaji: 'ka', cat: 'basic_1', mnemonic: 'A power cutter blade slicing through wood.', lookalike: 'が (ga)', example: { word: 'かさ', romaji: 'kasa', meaning: 'Umbrella' } },
+      { kana: 'き', romaji: 'ki', cat: 'basic_1', mnemonic: 'A skeleton key with two teeth.', lookalike: 'さ (sa)', example: { word: 'き', romaji: 'ki', meaning: 'Tree / Spirit' } },
+      { kana: 'く', romaji: 'ku', cat: 'basic_1', mnemonic: 'The beak of a cuckoo bird singing ku!', lookalike: 'へ (he)', example: { word: 'くま', romaji: 'kuma', meaning: 'Bear' } },
+      { kana: 'け', romaji: 'ke', cat: 'basic_1', mnemonic: 'A keg of beer with a tap on the side.', lookalike: 'は (ha)', example: { word: 'けいさつ', romaji: 'keisatsu', meaning: 'Police' } },
+      { kana: 'こ', romaji: 'ko', cat: 'basic_1', mnemonic: 'Two co-existing horizontal coin lines.', lookalike: 'に (ni)', example: { word: 'こども', romaji: 'kodomo', meaning: 'Child' } },
+
+      { kana: 'さ', romaji: 'sa', cat: 'basic_1', mnemonic: 'A smiling face enjoying a sweet snack.', lookalike: 'き (ki)', example: { word: 'さくら', romaji: 'sakura', meaning: 'Cherry Blossom' } },
+      { kana: 'し', romaji: 'shi', cat: 'basic_1', mnemonic: 'A curved drinking straw / She has long hooked hair.', lookalike: 'つ (tsu)', example: { word: 'しろ', romaji: 'shiro', meaning: 'White' } },
+      { kana: 'す', romaji: 'su', cat: 'basic_1', mnemonic: 'A swimmer doing a spiral dive loop.', lookalike: 'ぬ (nu)', example: { word: 'すし', romaji: 'sushi', meaning: 'Sushi' } },
+      { kana: 'せ', romaji: 'se', cat: 'basic_1', mnemonic: 'Two people sitting on a sunset bench.', lookalike: null, example: { word: 'せんせい', romaji: 'sensei', meaning: 'Teacher' } },
+      { kana: 'そ', romaji: 'so', cat: 'basic_1', mnemonic: 'Zig-zag sewing stitches on a cloth.', lookalike: 'ろ (ro)', example: { word: 'そら', romaji: 'sora', meaning: 'Sky' } },
+
+      // T / N / H
+      { kana: 'た', romaji: 'ta', cat: 'basic_2', mnemonic: 'Looks like the English letter "ta".', lookalike: 'な (na)', example: { word: 'たべもの', romaji: 'tabemono', meaning: 'Food' } },
+      { kana: 'ち', romaji: 'chi', cat: 'basic_2', mnemonic: 'A cheerleader waving her pom-pom.', lookalike: 'さ (sa flipped)', example: { word: 'ちいさい', romaji: 'chiisai', meaning: 'Small' } },
+      { kana: 'つ', romaji: 'tsu', cat: 'basic_2', mnemonic: 'A big tsunami wave curling over.', lookalike: 'し (shi)', example: { word: 'つくえ', romaji: 'tsukue', meaning: 'Desk' } },
+      { kana: 'て', romaji: 'te', cat: 'basic_2', mnemonic: 'A telephone pole bending sideways.', lookalike: null, example: { word: 'て', romaji: 'te', meaning: 'Hand' } },
+      { kana: 'と', romaji: 'to', cat: 'basic_2', mnemonic: 'A toe with a splinter stuck in it.', lookalike: null, example: { word: 'ともだち', romaji: 'tomodachi', meaning: 'Friend' } },
+
+      { kana: 'な', romaji: 'na', cat: 'basic_2', mnemonic: 'A nun praying before a holy cross.', lookalike: 'た (ta)', example: { word: 'なつ', romaji: 'natsu', meaning: 'Summer' } },
+      { kana: 'に', romaji: 'ni', cat: 'basic_2', mnemonic: 'A needle and two threads.', lookalike: 'こ (ko)', example: { word: 'にく', romaji: 'niku', meaning: 'Meat' } },
+      { kana: 'ぬ', romaji: 'nu', cat: 'basic_2', mnemonic: 'Noodles held with chopsticks in a loop.', lookalike: 'め (me)', example: { word: 'ぬま', romaji: 'numa', meaning: 'Swamp' } },
+      { kana: 'ね', romaji: 'ne', cat: 'basic_2', mnemonic: 'A cat with a curled tail sleeping.', lookalike: 'れ (re) / ぬ (nu)', example: { word: 'ねこ', romaji: 'neko', meaning: 'Cat' } },
+      { kana: 'の', romaji: 'no', cat: 'basic_2', mnemonic: 'A "NO entry" circular sign line.', lookalike: 'め (me)', example: { word: 'のりもの', romaji: 'norimono', meaning: 'Vehicle' } },
+
+      { kana: 'は', romaji: 'ha', cat: 'basic_2', mnemonic: 'A hockey stick hitting a puck.', lookalike: 'ほ (ho)', example: { word: 'はな', romaji: 'hana', meaning: 'Flower / Nose' } },
+      { kana: 'ひ', romaji: 'hi', cat: 'basic_2', mnemonic: 'A big wide laughing smile: Hi hi hi!', lookalike: null, example: { word: 'ひかり', romaji: 'hikari', meaning: 'Light' } },
+      { kana: 'ふ', romaji: 'fu', cat: 'basic_2', mnemonic: 'Mount Fuji with clouds floating around.', lookalike: null, example: { word: 'ふね', romaji: 'fune', meaning: 'Ship' } },
+      { kana: 'へ', romaji: 'he', cat: 'basic_2', mnemonic: 'A pointed hill peak climbing upwards.', lookalike: 'く (ku)', example: { word: 'へや', romaji: 'heya', meaning: 'Room' } },
+      { kana: 'ほ', romaji: 'ho', cat: 'basic_2', mnemonic: 'A chimney with smoke rising out.', lookalike: 'は (ha)', example: { word: 'ほん', romaji: 'hon', meaning: 'Book' } },
+
+      // M / Y / R / W / N
+      { kana: 'ま', romaji: 'ma', cat: 'basic_3', mnemonic: 'Calling Mom twice with hands up.', lookalike: 'ほ (ho)', example: { word: 'まち', romaji: 'machi', meaning: 'Town' } },
+      { kana: 'み', romaji: 'mi', cat: 'basic_3', mnemonic: 'Looks like the number 21 (twenty-one mi).', lookalike: null, example: { word: 'みず', romaji: 'mizu', meaning: 'Water' } },
+      { kana: 'む', romaji: 'mu', cat: 'basic_3', mnemonic: 'A cow face mooing: Muuu!', lookalike: 'す (su)', example: { word: 'むし', romaji: 'mushi', meaning: 'Insect' } },
+      { kana: 'め', romaji: 'me', cat: 'basic_3', mnemonic: 'An eye shape (Me means eye in Japanese!).', lookalike: 'ぬ (nu)', example: { word: 'めがね', romaji: 'megane', meaning: 'Glasses' } },
+      { kana: 'も', romaji: 'mo', cat: 'basic_3', mnemonic: 'A fish hook catching More fish.', lookalike: 'し (shi)', example: { word: 'もり', romaji: 'mori', meaning: 'Forest' } },
+
+      { kana: 'や', romaji: 'ya', cat: 'basic_3', mnemonic: 'A yak head with horns on top.', lookalike: null, example: { word: 'やま', romaji: 'yama', meaning: 'Mountain' } },
+      { kana: 'ゆ', romaji: 'yu', cat: 'basic_3', mnemonic: 'A unique fish swimming in a U-turn.', lookalike: null, example: { word: 'ゆき', romaji: 'yuki', meaning: 'Snow' } },
+      { kana: 'よ', romaji: 'yo', cat: 'basic_3', mnemonic: 'A yo-yo dangling on a line.', lookalike: 'ま (ma)', example: { word: 'よる', romaji: 'yoru', meaning: 'Night' } },
+
+      { kana: 'ら', romaji: 'ra', cat: 'basic_3', mnemonic: 'A rabbit sitting on its hind legs.', lookalike: 'ち (chi)', example: { word: 'らいげつ', romaji: 'raigetsu', meaning: 'Next month' } },
+      { kana: 'り', romaji: 'ri', cat: 'basic_3', mnemonic: 'Reeds swaying gracefully in the river.', lookalike: 'い (i)', example: { word: 'りんご', romaji: 'ringo', meaning: 'Apple' } },
+      { kana: 'る', romaji: 'ru', cat: 'basic_3', mnemonic: 'A route with a loop at the finish line.', lookalike: 'ろ (ro)', example: { word: 'くるま', romaji: 'kuruma', meaning: 'Car' } },
+      { kana: 'れ', romaji: 're', cat: 'basic_3', mnemonic: 'A runner bending over to rest after racing.', lookalike: 'ね (ne) / わ (wa)', example: { word: 'れいぞうこ', romaji: 'reizouko', meaning: 'Refrigerator' } },
+      { kana: 'ろ', romaji: 'ro', cat: 'basic_3', mnemonic: 'A road with no loop at the end.', lookalike: 'る (ru)', example: { word: 'ろく', romaji: 'roku', meaning: 'Six' } },
+
+      { kana: 'わ', romaji: 'wa', cat: 'basic_3', mnemonic: 'A wasp flying with a big round tail.', lookalike: 'ね (ne) / れ (re)', example: { word: 'わたし', romaji: 'watashi', meaning: 'I / Me' } },
+      { kana: 'を', romaji: 'wo', cat: 'basic_3', mnemonic: 'A water skater gliding on water.', lookalike: 'ち (chi)', example: { word: 'を', romaji: 'wo', meaning: 'Object particle' } },
+      { kana: 'ん', romaji: 'n', cat: 'basic_3', mnemonic: 'Looks like the lowercase cursive letter "n".', lookalike: 'え (e)', example: { word: 'にほん', romaji: 'nihon', meaning: 'Japan' } },
+
+      // Dakuten & Combos
+      { kana: 'が', romaji: 'ga', cat: 'dakuten', mnemonic: 'か (ka) with dakuten marks.', lookalike: null, example: { word: 'がくせい', romaji: 'gakusei', meaning: 'Student' } },
+      { kana: 'ざ', romaji: 'za', cat: 'dakuten', mnemonic: 'さ (sa) with dakuten marks.', lookalike: null, example: { word: 'ざっし', romaji: 'zasshi', meaning: 'Magazine' } },
+      { kana: 'だ', romaji: 'da', cat: 'dakuten', mnemonic: 'た (ta) with dakuten marks.', lookalike: null, example: { word: 'だいがく', romaji: 'daigaku', meaning: 'University' } },
+      { kana: 'ば', romaji: 'ba', cat: 'dakuten', mnemonic: 'は (ha) with dakuten voice marks.', lookalike: 'ぱ (pa)', example: { word: 'ばら', romaji: 'bara', meaning: 'Rose' } },
+      { kana: 'ぱ', romaji: 'pa', cat: 'dakuten', mnemonic: 'は (ha) with a handakuten pop circle.', lookalike: 'ば (ba)', example: { word: 'はっぱ', romaji: 'happa', meaning: 'Leaf' } },
+      { kana: 'きゃ', romaji: 'kya', cat: 'dakuten', mnemonic: 'き (ki) + small や (ya) combo sound.', lookalike: null, example: { word: 'きゃく', romaji: 'kyaku', meaning: 'Guest / Customer' } },
+      { kana: 'しゃ', romaji: 'sha', cat: 'dakuten', mnemonic: 'し (shi) + small や (ya) combo sound.', lookalike: null, example: { word: 'しゃしん', romaji: 'shashin', meaning: 'Photograph' } },
+      { kana: 'ちゃ', romaji: 'cha', cat: 'dakuten', mnemonic: 'ち (chi) + small や (ya) combo sound.', lookalike: null, example: { word: 'おちゃ', romaji: 'ocha', meaning: 'Green Tea' } },
+      { kana: 'にゃ', romaji: 'nya', cat: 'dakuten', mnemonic: 'に (ni) + small や (ya) combo sound.', lookalike: null, example: { word: 'にゃんこ', romaji: 'nyanko', meaning: 'Kitty' } }
+    ];
+
+    const state = {
+      mode: 'explore',
+      category: 'basic_1',
+      showRomaji: true,
+      selectedKana: 'あ',
+      quiz: {
+        currentQuestion: null,
+        options: [],
+        selectedAnswer: null,
+        isAnswered: false,
+        score: 0,
+        streak: 0,
+        totalAsked: 0
+      }
+    };
+
+    function getFilteredList() {
+      if (state.category === 'all') return HIRAGANA_DATA;
+      return HIRAGANA_DATA.filter(item => item.cat === state.category);
+    }
+
+    function findChar(kana) {
+      return HIRAGANA_DATA.find(item => item.kana === kana) || HIRAGANA_DATA[0];
+    }
+
+    function shuffle(arr) {
+      for (let i = arr.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [arr[i], arr[j]] = [arr[j], arr[i]];
+      }
+      return arr;
+    }
+
+    function generateQuizQuestion() {
+      const list = getFilteredList();
+      if (list.length === 0) return;
+
+      // Avoid asking the same character twice in a row
+      const prev = state.quiz.currentQuestion;
+      const candidates = list.length > 1 && prev ? list.filter(item => item.kana !== prev.kana) : list;
+      const target = candidates[Math.floor(Math.random() * candidates.length)];
+
+      // Prefer distractors from the same category, then fill from the rest
+      const sameCat = shuffle(list.filter(item => item.kana !== target.kana));
+      const others = shuffle(HIRAGANA_DATA.filter(item => item.kana !== target.kana && !sameCat.includes(item)));
+      const distractors = sameCat.concat(others).slice(0, 3);
+
+      state.quiz.currentQuestion = target;
+      state.quiz.options = shuffle([target, ...distractors]);
+      state.quiz.selectedAnswer = null;
+      state.quiz.isAnswered = false;
+    }
+
+    function render() {
+      const viewZone = document.getElementById('view-zone');
+      const filtered = getFilteredList();
+      if (!filtered.some(item => item.kana === state.selectedKana) && filtered.length > 0) {
+        state.selectedKana = filtered[0].kana;
+      }
+
+      if (state.mode === 'explore') {
+        renderExploreView(viewZone, filtered);
+      } else {
+        renderQuizView(viewZone);
+      }
+
+      document.querySelectorAll('#category-chips .chip').forEach(chip => {
+        chip.classList.toggle('is-active', chip.dataset.cat === state.category);
+      });
+      document.querySelectorAll('#mode-segmented button').forEach(btn => {
+        btn.classList.toggle('is-active', btn.dataset.mode === state.mode);
+      });
+      document.getElementById('romaji-switch').checked = state.showRomaji;
+    }
+
+    function renderExploreView(container, filteredList) {
+      const c = findChar(state.selectedKana);
+
+      const cells = filteredList.map(item => `
+        <button type="button" class="kana-cell ${item.kana === c.kana ? 'is-selected' : ''}" data-kana="${item.kana}">
+          <span class="kana-glyph">${item.kana}</span>
+          ${state.showRomaji ? `<span class="kana-romaji">${item.romaji}</span>` : ''}
+        </button>
+      `).join('');
+
+      container.innerHTML = `
+        <div class="grid-container">${cells}</div>
+        <div class="inspector-card">
+          <div class="inspector-glyph-box">
+            <span class="inspector-glyph">${c.kana}</span>
+            <span class="inspector-romaji">${c.romaji}</span>
+          </div>
+          <div class="inspector-details">
+            <div class="mnemonic-box">
+              <span class="label">Mnemonic</span>
+              ${c.mnemonic}
+            </div>
+            <div class="inspector-meta">
+              <span class="tag">${c.example.word === c.kana ? 'Word' : 'Example'}: <strong>${c.example.word}</strong> (${c.example.romaji}) = ${c.example.meaning}</span>
+              ${c.lookalike ? `<span class="tag warning">Look-alike: ${c.lookalike}</span>` : ''}
+            </div>
+          </div>
+        </div>
+      `;
+
+      container.querySelectorAll('.kana-cell').forEach(btn => {
+        btn.addEventListener('click', () => {
+          state.selectedKana = btn.dataset.kana;
+          render();
+        });
+      });
+    }
+
+    function renderQuizView(container) {
+      if (!state.quiz.currentQuestion) generateQuizQuestion();
+      const q = state.quiz.currentQuestion;
+      if (!q) return;
+
+      const options = state.quiz.options.map((opt, i) => {
+        let cls = '';
+        if (state.quiz.isAnswered) {
+          if (opt.kana === q.kana) cls = 'is-correct';
+          else if (opt.kana === state.quiz.selectedAnswer) cls = 'is-incorrect';
+        }
+        return `
+          <button type="button" class="quiz-option-btn ${cls}" data-kana="${opt.kana}" ${state.quiz.isAnswered ? 'disabled' : ''}>
+            ${opt.romaji}
+          </button>
+        `;
+      }).join('');
+
+      let feedback = '';
+      if (state.quiz.isAnswered) {
+        const ok = state.quiz.selectedAnswer === q.kana;
+        feedback = `
+          <div class="quiz-feedback-box">
+            <div class="feedback-title ${ok ? 'ok' : 'bad'}">
+              ${ok ? 'Correct!' : `Not quite. It's "${q.romaji}".`}
+            </div>
+            <div class="feedback-tip">${q.mnemonic}</div>
+            <button type="button" class="next-btn" id="next-btn">Next (Enter)</button>
+          </div>
+        `;
+      }
+
+      container.innerHTML = `
+        <div class="quiz-view">
+          <div class="quiz-stats-bar">
+            <div>Score: <strong>${state.quiz.score}</strong> / ${state.quiz.totalAsked}</div>
+            <div>Streak: <strong>${state.quiz.streak}</strong></div>
+          </div>
+          <div class="quiz-card">
+            <span class="quiz-prompt">How do you read this? (keys 1-4)</span>
+            <div class="quiz-prompt-glyph">${q.kana}</div>
+            <div class="quiz-options-grid">${options}</div>
+            ${feedback}
+          </div>
+        </div>
+      `;
+
+      container.querySelectorAll('.quiz-option-btn').forEach(btn => {
+        btn.addEventListener('click', () => answer(btn.dataset.kana));
+      });
+      const nextBtn = document.getElementById('next-btn');
+      if (nextBtn) {
+        nextBtn.addEventListener('click', nextQuestion);
+        nextBtn.focus();
+      }
+    }
+
+    function answer(kana) {
+      if (state.quiz.isAnswered) return;
+      const q = state.quiz.currentQuestion;
+      state.quiz.selectedAnswer = kana;
+      state.quiz.isAnswered = true;
+      state.quiz.totalAsked += 1;
+      if (kana === q.kana) {
+        state.quiz.score += 1;
+        state.quiz.streak += 1;
+      } else {
+        state.quiz.streak = 0;
+      }
+      render();
+    }
+
+    function nextQuestion() {
+      generateQuizQuestion();
+      render();
+    }
+
+    document.querySelectorAll('#mode-segmented button').forEach(btn => {
+      btn.addEventListener('click', () => {
+        state.mode = btn.dataset.mode;
+        render();
+      });
+    });
+
+    document.querySelectorAll('#category-chips .chip').forEach(chip => {
+      chip.addEventListener('click', () => {
+        state.category = chip.dataset.cat;
+        if (state.mode === 'quiz') generateQuizQuestion();
+        else state.quiz.currentQuestion = null;
+        render();
+      });
+    });
+
+    document.getElementById('romaji-switch').addEventListener('change', e => {
+      state.showRomaji = e.target.checked;
+      render();
+    });
+
+    document.addEventListener('keydown', e => {
+      if (state.mode !== 'quiz' || e.altKey || e.ctrlKey || e.metaKey) return;
+      if (!state.quiz.isAnswered && e.key >= '1' && e.key <= '4') {
+        const opt = state.quiz.options[Number(e.key) - 1];
+        if (opt) answer(opt.kana);
+      } else if (state.quiz.isAnswered && e.key === 'Enter' && document.activeElement?.id !== 'next-btn') {
+        nextQuestion();
+      }
+    });
+
+    render();
+  </script>
+</body>
+</html>
